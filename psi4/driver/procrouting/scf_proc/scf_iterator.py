@@ -277,6 +277,7 @@ def scf_iterate(self, e_conv=None, d_conv=None):
     efp_enabled = hasattr(self.molecule(), 'EFP')
     cosx_enabled = "COSX" in core.get_option('SCF', 'SCF_TYPE')
     directjk_enabled = "DIRECT" in core.get_option('SCF', 'SCF_TYPE')
+    incfock_enabled = core.get_option('SCF', 'INCFOCK')
     ooo_scf = core.get_option("SCF", "ORBITAL_OPTIMIZER_PACKAGE") in ["OOO", "OPENORBITALOPTIMIZER"]
     if ooo_scf:
         pcm_enabled = core.get_option('SCF', 'PCM')
@@ -339,7 +340,7 @@ def scf_iterate(self, e_conv=None, d_conv=None):
         self.jk().set_COSX_grid("Initial")
 
     variable_screening = False
-    if directjk_enabled:
+    if directjk_enabled and incfock_enabled:
         variable_screening = True
 
     # maximum number of scf iterations to run after early screening is disabled
@@ -377,10 +378,10 @@ def scf_iterate(self, e_conv=None, d_conv=None):
         SCFE = 0.0
         self.clear_external_potentials()
 
-        if(variable_screening): # trying out qchem's incfock error mitigation strategy
-            # save user specified thresh
+        if variable_screening: # trying out qchem's incfock error mitigation strategy
+            # save user specified screening thresh
             fixed_thresh = core.get_option('SCF', 'INTS_TOLERANCE')
-            if(self.iteration_ == 1):
+            if self.iteration_ == 1:
                 core.set_local_option("SCF", "INTS_TOLERANCE", 1e-6)
             else:
                 itr_thresh = fixed_thresh * Dnorm
