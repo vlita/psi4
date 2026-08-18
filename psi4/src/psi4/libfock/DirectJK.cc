@@ -125,7 +125,17 @@ void DirectJK::print_header() const {
     }
 }
 void DirectJK::preiterations() {
+    // clear, resize, and zero delta buffers here
+    J_delta_.clear();
+    K_delta_.clear();
+    wK_delta_.clear();
 
+    for(auto const &Di : D_ao_) {
+        J_delta_.push_back(Di->clone());
+        K_delta_.push_back(Di->clone());
+        wK_delta_.push_back(Di->clone());
+    }
+    
 #ifdef USING_BrianQC
     if (brianEnable) {
         double threshold = cutoff_ * (brianCPHFFlag ? 1e-3 : 1e-0); // CPHF needs higher precision
@@ -144,12 +154,16 @@ void DirectJK::incfock_setup() {
 	        initial_iteration_ = true;
 
             D_ref_ = D_ao_;
-            zero();
+            zero(); // should zero J and K as normal, delta J and K remain untouched
         } else { // Otherwise, the iteration is incremental
             for (size_t jki = 0; jki < njk; jki++) {
                 D_ref_[jki] = D_ao_[jki]->clone();
                 D_ref_[jki]->subtract(D_prev_[jki]);
             }
+            // zero delta buffers here, reference J & K are untouched unless we accumulate into them
+            J_delta_.zero();
+            K_delta_.zero();
+            wK_delta_.zero(); 
         }
     } else {
         D_ref_ = D_ao_;
@@ -159,7 +173,8 @@ void DirectJK::incfock_setup() {
 
 void DirectJK::incfock_postiter() {
     // Save a copy of the density for the next iteration
-    D_prev_.clear();
+    D_prev_.clear();   
+
     for(auto const &Di : D_ao_) {
         D_prev_.push_back(Di->clone());
     }
@@ -361,9 +376,12 @@ void DirectJK::compute_JK() {
             ints.push_back(std::shared_ptr<TwoBodyAOInt>(ints[0]->clone()));
         }
         if (do_J_) {
-            build_JK_matrices(ints, D_ref_, J_ao_, wK_ao_);
+            build_JK_matrices(ints, D_ref_, J_delta_, wK_delta_);
+            J_ao_.add(J_delta_);
+            wK_ao_.add(wK_delta_);
         } else {
-            build_JK_matrices(ints, D_ref_, temp, wK_ao_);
+            build_JK_matrices(ints, D_ref_, temp, wK_delta_);
+            wK_ao_.add(wK_delta_); 
         }
     }
 
@@ -375,11 +393,15 @@ void DirectJK::compute_JK() {
             ints.push_back(std::shared_ptr<TwoBodyAOInt>(ints[0]->clone()));
         }
         if (do_J_ && do_K_) {
-            build_JK_matrices(ints, D_ref_, J_ao_, K_ao_);
+            build_JK_matrices(ints, D_ref_, J_delta_, K_delta_);
+            J_ao_.add(J_delta_);
+            K_ao_.add(K_delta_);
         } else if (do_J_) {
-            build_JK_matrices(ints, D_ref_, J_ao_, temp);
+            build_JK_matrices(ints, D_ref_, J_delta_, temp);
+            J_ao_.add(J_delta_);
         } else {
-            build_JK_matrices(ints, D_ref_, temp, K_ao_);
+            build_JK_matrices(ints, D_ref_, temp, K_delta_);
+            K_ao_.add(K_delta_);
         }
     }
 
@@ -792,7 +814,7 @@ void DirectJK::build_JK_matrices(std::vector<std::shared_ptr<TwoBodyAOInt>>& int
             if (build_J) {
 
                 // > J_PQ < //
-
+                
                 for (int P2 = 0; P2 < nPtask; P2++) {
                     for (int Q2 = 0; Q2 < nQtask; Q2++) {
                         int P = task_shells[P2start + P2];
