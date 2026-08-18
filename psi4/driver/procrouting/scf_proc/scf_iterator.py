@@ -276,6 +276,7 @@ def scf_iterate(self, e_conv=None, d_conv=None):
     frac_enabled = _validate_frac()
     efp_enabled = hasattr(self.molecule(), 'EFP')
     cosx_enabled = "COSX" in core.get_option('SCF', 'SCF_TYPE')
+    directjk_enabled = "DIRECT" in core.get_option('SCF', 'SCF_TYPE')
     ooo_scf = core.get_option("SCF", "ORBITAL_OPTIMIZER_PACKAGE") in ["OOO", "OPENORBITALOPTIMIZER"]
     if ooo_scf:
         pcm_enabled = core.get_option('SCF', 'PCM')
@@ -337,6 +338,10 @@ def scf_iterate(self, e_conv=None, d_conv=None):
         early_screening = True
         self.jk().set_COSX_grid("Initial")
 
+    variable_screening = False
+    if directjk_enabled:
+        variable_screening = True
+
     # maximum number of scf iterations to run after early screening is disabled
     scf_maxiter_post_screening = core.get_option('SCF', 'COSX_MAXITER_FINAL')
 
@@ -371,6 +376,15 @@ def scf_iterate(self, e_conv=None, d_conv=None):
 
         SCFE = 0.0
         self.clear_external_potentials()
+
+        if(variable_screening): # trying out qchem's incfock error mitigation strategy
+            # save user specified thresh
+            fixed_thresh = core.get_option('SCF', 'INTS_TOLERANCE')
+            if(self.iteration_ == 1):
+                core.set_local_option("SCF", "INTS_TOLERANCE", 1e-6)
+            else:
+                itr_thresh = fixed_thresh * Dnorm
+                core.set_local_option("SCF", "INTS_TOLERANCE", itr_thresh)
 
         # Two-electron contribution to Fock matrix from self.jk()
         core.timer_on("HF: Form G")
