@@ -278,6 +278,7 @@ def scf_iterate(self, e_conv=None, d_conv=None):
     cosx_enabled = "COSX" in core.get_option('SCF', 'SCF_TYPE')
     directjk_enabled = "DIRECT" in core.get_option('SCF', 'SCF_TYPE')
     incfock_enabled = core.get_option('SCF', 'INCFOCK')
+    var_tol_enabled = core.get_option('SCF', 'INCFOCK_VAR_INTS_TOL')
     ooo_scf = core.get_option("SCF", "ORBITAL_OPTIMIZER_PACKAGE") in ["OOO", "OPENORBITALOPTIMIZER"]
     if ooo_scf:
         pcm_enabled = core.get_option('SCF', 'PCM')
@@ -340,7 +341,7 @@ def scf_iterate(self, e_conv=None, d_conv=None):
         self.jk().set_COSX_grid("Initial")
 
     variable_screening = False
-    if directjk_enabled and incfock_enabled:
+    if directjk_enabled and incfock_enabled and var_tol_enabled:
         variable_screening = True
 
     # maximum number of scf iterations to run after early screening is disabled

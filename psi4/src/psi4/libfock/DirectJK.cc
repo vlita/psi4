@@ -125,16 +125,10 @@ void DirectJK::print_header() const {
     }
 }
 void DirectJK::preiterations() {
-    // clear, resize, and zero delta buffers here
+    // clear delta buffers here
     J_delta_.clear();
     K_delta_.clear();
     wK_delta_.clear();
-
-    for(auto const &Di : D_ao_) {
-        J_delta_.push_back(Di->clone());
-        K_delta_.push_back(Di->clone());
-        wK_delta_.push_back(Di->clone());
-    }
     
 #ifdef USING_BrianQC
     if (brianEnable) {
@@ -160,14 +154,33 @@ void DirectJK::incfock_setup() {
                 D_ref_[jki] = D_ao_[jki]->clone();
                 D_ref_[jki]->subtract(D_prev_[jki]);
             }
-            // zero delta buffers here, reference J & K are untouched unless we accumulate into them
-            J_delta_.zero();
-            K_delta_.zero();
-            wK_delta_.zero(); 
+            // need to zero the incremental buffers each iteration
+            for (auto& Jd : J_delta_) {
+                Jd->zero();
+            }
+            for (auto& Kd : K_delta_) {
+                Kd->zero();
+            }
+            for (auto& wKd : wK_delta_) {
+                wKd->zero();
+            }
         }
     } else {
         D_ref_ = D_ao_;
         zero();
+        // probably ok to only do this here but we'll see
+        if(initial_iteration_) {
+            // resize delta buffers once in the initial iter
+            for(auto const &Ji : J_ao_) {
+                J_delta_.push_back(Ji->clone());
+            }
+            for(auto const &Ki : K_ao_) {
+                K_delta_.push_back(Ki->clone());
+            }
+            for(auto const &wKi : wK_ao_) {
+                wK_delta_.push_back(wKi->clone());
+            }
+        }
     }
 }
 
@@ -377,11 +390,17 @@ void DirectJK::compute_JK() {
         }
         if (do_J_) {
             build_JK_matrices(ints, D_ref_, J_delta_, wK_delta_);
-            J_ao_.add(J_delta_);
-            wK_ao_.add(wK_delta_);
+            for (size_t i = 0; i < J_ao_.size(); i++) {
+                J_ao_[i]->add(J_delta_[i]);
+            }
+            for (size_t i = 0; i < wK_ao_.size(); i++) {
+                wK_ao_[i]->add(wK_delta_[i]);
+            }
         } else {
             build_JK_matrices(ints, D_ref_, temp, wK_delta_);
-            wK_ao_.add(wK_delta_); 
+            for (size_t i = 0; i < wK_ao_.size(); i++) {
+                wK_ao_[i]->add(wK_delta_[i]);
+            }        
         }
     }
 
@@ -394,14 +413,22 @@ void DirectJK::compute_JK() {
         }
         if (do_J_ && do_K_) {
             build_JK_matrices(ints, D_ref_, J_delta_, K_delta_);
-            J_ao_.add(J_delta_);
-            K_ao_.add(K_delta_);
+            for (size_t i = 0; i < J_ao_.size(); i++) {
+                J_ao_[i]->add(J_delta_[i]);
+            }
+            for (size_t i = 0; i < K_ao_.size(); i++) {
+                K_ao_[i]->add(K_delta_[i]);
+            }
         } else if (do_J_) {
             build_JK_matrices(ints, D_ref_, J_delta_, temp);
-            J_ao_.add(J_delta_);
+            for (size_t i = 0; i < J_ao_.size(); i++) {
+                J_ao_[i]->add(J_delta_[i]);
+            }
         } else {
             build_JK_matrices(ints, D_ref_, temp, K_delta_);
-            K_ao_.add(K_delta_);
+            for (size_t i = 0; i < K_ao_.size(); i++) {
+                K_ao_[i]->add(K_delta_[i]);
+            }
         }
     }
 

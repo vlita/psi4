@@ -1647,6 +1647,8 @@ int read_options(const std::string &name, Options &options, bool suppress_printi
         options.add_int("INCFOCK_FULL_FOCK_EVERY", 5);
         /*- The density threshold at which to stop building the Fock matrix incrementally -*/
         options.add_double("INCFOCK_CONVERGENCE", 1.0e-5);
+        /*- Use a variable integral tolerance while building the Fock matrix incrementally? -*/
+        options.add_bool("INCFOCK_VAR_INTS_TOL", false);
 
         /*- The screening tolerance used for ERI/Density sparsity in the LinK algorithm -*/
         options.add_double("LINK_INTS_TOLERANCE", 1.0e-12);
