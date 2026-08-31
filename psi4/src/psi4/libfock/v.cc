@@ -68,8 +68,6 @@
 #include <xc.h>
 #include <cublas_v2.h>
 #include "psi4/libfock/cuESTCommon.h"
-extern cublasHandle_t cublas_handle;
-extern cuestHandle_t cuest_handle;
 #endif
 
 #ifdef USING_BrianQC
@@ -270,7 +268,7 @@ std::shared_ptr<VBase> VBase::build_V(std::shared_ptr<BasisSet> primary, std::sh
 void VBase::set_Cocc(std::vector<SharedMatrix> Coccs) {
 #ifdef USING_cuEST
     if (options_.get_bool("USE_CUEST")) {
-        cuest_common::ensure_cuest_initialized();
+        cuest_common::ScopedContext context(cuest_common::Context::Vxc);
 
         std::vector<uint64_t> d_Cocc_noccs_provided;
         uint64_t d_Cocc_size_needed = 0;
@@ -360,7 +358,8 @@ void VBase::initialize() {
     // No workers are needed for cuEST, so we can just create the XC Integral Plan here and return
     if (options_.get_bool("USE_CUEST")) {
         validate_cuest_xc_components(functional_);
-        cuest_common::ensure_cuest_initialized();
+        cuest_common::ScopedContext context(cuest_common::Context::Vxc);
+        const cuestHandle_t cuest_handle = context.cuest();
 
         cuestXCIntPlanParameters_t xcint_params;
         CHECK_CUEST(cuestParametersCreate(CUEST_XCINTPLAN_PARAMETERS, reinterpret_cast<void**>(&xcint_params)));
@@ -374,7 +373,7 @@ void VBase::initialize() {
         // functional objects.  Defined the plan's functional as HF here, just as an unused placeholder.
         CHECK_CUEST(cuestXCIntPlanCreateWorkspaceQuery(
             cuest_handle,
-            primary_->cuest_basis(),
+            primary_->cuest_basis(true),
             grid_->cuest_grid(),
             CUEST_XCINTPLAN_PARAMETERS_FUNCTIONAL_HF,
             xcint_params,
@@ -387,7 +386,7 @@ void VBase::initialize() {
 
         CHECK_CUEST(cuestXCIntPlanCreate(
             cuest_handle,
-            primary_->cuest_basis(),
+            primary_->cuest_basis(true),
             grid_->cuest_grid(),
             CUEST_XCINTPLAN_PARAMETERS_FUNCTIONAL_HF,
             xcint_params,
@@ -399,7 +398,7 @@ void VBase::initialize() {
         if (functional_->needs_vv10()) {
             CHECK_CUEST(cuestXCIntPlanCreateWorkspaceQuery(
                 cuest_handle,
-                primary_->cuest_basis(),
+                primary_->cuest_basis(true),
                 vv10_grid_->cuest_grid(),
                 CUEST_XCINTPLAN_PARAMETERS_FUNCTIONAL_HF,
                 xcint_params,
@@ -410,7 +409,7 @@ void VBase::initialize() {
             cuest_vv10_xcint_ws_ptr_ = cuest_common::allocateWorkspace(&persistentWorkspaceDescriptor);
             CHECK_CUEST(cuestXCIntPlanCreate(
                 cuest_handle,
-                primary_->cuest_basis(),
+                primary_->cuest_basis(true),
                 vv10_grid_->cuest_grid(),
                 CUEST_XCINTPLAN_PARAMETERS_FUNCTIONAL_HF,
                 xcint_params,
@@ -978,30 +977,36 @@ void VBase::print_header() const {
 }
 std::shared_ptr<BlockOPoints> VBase::get_block(int block) { return grid_->blocks()[block]; }
 size_t VBase::nblocks() { return grid_->blocks().size(); }
-void VBase::finalize() { grid_.reset();
+void VBase::finalize() {
 #ifdef USING_cuEST
-    if (d_Coccs_AO_ != nullptr) {
-        cudaFree(d_Coccs_AO_);
-        d_Coccs_AO_ = nullptr;
-        d_Cocc_noccs_.clear();
-    }
-    if (cuest_xcint_plan_ != nullptr) {
-        CHECK_CUEST(cuestXCIntPlanDestroy(cuest_xcint_plan_));
-        cuest_xcint_plan_ = nullptr;
-    }
-    if (cuest_xcint_ws_ptr_ != nullptr) {
-        cuest_common::freeWorkspace(cuest_xcint_ws_ptr_);
-        cuest_xcint_ws_ptr_ = nullptr;
-    }
-    if (cuest_vv10_xcint_plan_ != nullptr) {
-        CHECK_CUEST(cuestXCIntPlanDestroy(cuest_vv10_xcint_plan_));
-        cuest_vv10_xcint_plan_ = nullptr;
-    }
-    if (cuest_vv10_xcint_ws_ptr_ != nullptr) {
-        cuest_common::freeWorkspace(cuest_vv10_xcint_ws_ptr_);
-        cuest_vv10_xcint_ws_ptr_ = nullptr;
+    if (d_Coccs_AO_ || cuest_xcint_plan_ || cuest_xcint_ws_ptr_ || cuest_vv10_xcint_plan_ ||
+        cuest_vv10_xcint_ws_ptr_) {
+        cuest_common::ScopedContext context(cuest_common::Context::Vxc);
+        if (cuest_vv10_xcint_plan_ != nullptr) {
+            CHECK_CUEST(cuestXCIntPlanDestroy(cuest_vv10_xcint_plan_));
+            cuest_vv10_xcint_plan_ = nullptr;
+        }
+        if (cuest_vv10_xcint_ws_ptr_ != nullptr) {
+            cuest_common::freeWorkspace(cuest_vv10_xcint_ws_ptr_);
+            cuest_vv10_xcint_ws_ptr_ = nullptr;
+        }
+        if (cuest_xcint_plan_ != nullptr) {
+            CHECK_CUEST(cuestXCIntPlanDestroy(cuest_xcint_plan_));
+            cuest_xcint_plan_ = nullptr;
+        }
+        if (cuest_xcint_ws_ptr_ != nullptr) {
+            cuest_common::freeWorkspace(cuest_xcint_ws_ptr_);
+            cuest_xcint_ws_ptr_ = nullptr;
+        }
+        if (d_Coccs_AO_ != nullptr) {
+            cudaFree(d_Coccs_AO_);
+            d_Coccs_AO_ = nullptr;
+            d_Cocc_noccs_.clear();
+        }
     }
 #endif
+    vv10_grid_.reset();
+    grid_.reset();
 }
 void VBase::build_collocation_cache(size_t memory) {
     // No cuEST guard here, deliberately: this is called on every SCF init
@@ -1535,7 +1540,8 @@ void RV::compute_V(std::vector<SharedMatrix> ret) {
     }
 #ifdef USING_cuEST
     if (options_.get_bool("USE_CUEST")) {
-        cuest_common::ensure_cuest_initialized();
+        cuest_common::ScopedContext context(cuest_common::Context::Vxc);
+        const cuestHandle_t cuest_handle = context.cuest();
 
         if ((d_Cocc_noccs_.size() != 1)) {
             throw PSIEXCEPTION("V: RKS should have only one Cocc Matrix");
@@ -2720,7 +2726,8 @@ SharedMatrix RV::compute_gradient() {
     int natom = primary_->molecule()->natom();
 #ifdef USING_cuEST
     if (options_.get_bool("USE_CUEST")) {
-        cuest_common::ensure_cuest_initialized();
+        cuest_common::ScopedContext context(cuest_common::Context::Vxc);
+        const cuestHandle_t cuest_handle = context.cuest();
 
         if ((d_Cocc_noccs_.size() != 1)) {
             throw PSIEXCEPTION("V: RKS should have only one Cocc Matrix");
@@ -3858,7 +3865,8 @@ void UV::compute_V(std::vector<SharedMatrix> ret) {
     }
 #ifdef USING_cuEST
     if (options_.get_bool("USE_CUEST")) {
-        cuest_common::ensure_cuest_initialized();
+        cuest_common::ScopedContext context(cuest_common::Context::Vxc);
+        const cuestHandle_t cuest_handle = context.cuest();
 
         if ((d_Cocc_noccs_.size() != 2)) {
             throw PSIEXCEPTION("V: UKS should have only two Cocc Matrices");
@@ -5639,7 +5647,9 @@ SharedMatrix UV::compute_gradient() {
 
 #ifdef USING_cuEST
     if (options_.get_bool("USE_CUEST")) {
-        cuest_common::ensure_cuest_initialized();
+        cuest_common::ScopedContext context(cuest_common::Context::Vxc);
+        const cuestHandle_t cuest_handle = context.cuest();
+        const cublasHandle_t cublas_handle = context.cublas();
 
         if ((d_Cocc_noccs_.size() != 2)) {
             throw PSIEXCEPTION("gradient: UKS should have only two Cocc Matrices");

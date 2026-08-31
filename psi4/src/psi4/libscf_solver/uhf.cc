@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <functional>
+#include <future>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -183,10 +184,23 @@ void UHF::form_V() {
     // Vb_ = Va_;
 }
 void UHF::form_G() {
+#ifdef USING_cuEST
+    const bool use_cuest = options_.get_bool("USE_CUEST");
+    const bool parallel_cuest = use_cuest && options_.get_int("CUEST_NUM_GPUS") == 2 && functional_->needs_xc();
+#else
+    const bool use_cuest = false;
+    const bool parallel_cuest = false;
+#endif
+
     if (functional_->needs_xc()) {
-        form_V();
-        Ga_->copy(Va_);
-        Gb_->copy(Vb_);
+        if (parallel_cuest) {
+            potential_->set_D({Da_, Db_});
+            potential_->set_Cocc({Ca_subset("AO", "OCC"), Cb_subset("AO", "OCC")});
+        } else {
+            form_V();
+            Ga_->copy(Va_);
+            Gb_->copy(Vb_);
+        }
     } else {
         Ga_->zero();
         Gb_->zero();
@@ -197,19 +211,26 @@ void UHF::form_G() {
     C.clear();
     C.push_back(Ca_subset("SO", "OCC"));
     C.push_back(Cb_subset("SO", "OCC"));
-    // Run the JK object
-    jk_->compute();
+    if (parallel_cuest) {
+        struct TimerSkipGuard {
+            TimerSkipGuard() { start_skip_timers(); }
+            ~TimerSkipGuard() { stop_skip_timers(); }
+        } timer_skip_guard;
+
+        auto vxc_future = std::async(std::launch::async, [this]() { potential_->compute_V({Va_, Vb_}); });
+        jk_->compute();
+        vxc_future.get();
+        Ga_->copy(Va_);
+        Gb_->copy(Vb_);
+    } else {
+        jk_->compute();
+    }
     // Pull the J and K matrices off
     const std::vector<SharedMatrix>& J = jk_->J();
     const std::vector<SharedMatrix>& K = jk_->K();
     const std::vector<SharedMatrix>& wK = jk_->wK();
     J_->copy(J[0]);
     J_->add(J[1]);
-#ifdef USING_cuEST
-    const bool use_cuest = options_.get_bool("USE_CUEST");
-#else
-    const bool use_cuest = false;
-#endif
     if (functional_->is_x_hybrid() || (use_cuest && functional_->is_x_lrc())) {
         Ka_ = K[0];
         Kb_ = K[1];

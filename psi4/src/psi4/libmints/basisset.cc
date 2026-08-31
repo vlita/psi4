@@ -129,10 +129,6 @@ BasisSet::BasisSet() {
     target_ = "(Empty Basis Set)";
     shells_[0] = GaussianShell(Gaussian, 0, nprimitive_, uoriginal_coefficients_.data(), ucoefficients_.data(),
                                uerd_coefficients_.data(), uexponents_.data(), GaussianType(0), 0, xyz_.data(), 0);
-#ifdef USING_cuEST
-    cuest_basis_ = nullptr;
-    cuest_basis_ws_ptr_ = nullptr;
-#endif
 }
 
 BasisSet::~BasisSet() {
@@ -632,11 +628,6 @@ BasisSet::BasisSet(const std::string &basistype, SharedMolecule mol,
                    std::map<std::string, std::map<std::string, std::vector<ShellInfo>>> &shell_map,
                    std::map<std::string, std::map<std::string, std::vector<ShellInfo>>> &ecp_shell_map)
     : name_(basistype), molecule_(mol) {
-#ifdef USING_cuEST
-    cuest_basis_ = nullptr;
-    cuest_basis_ws_ptr_ = nullptr;
-#endif
-
     // Singletons
     initialize_singletons();
 
@@ -1309,18 +1300,20 @@ void BasisSet::negative_gaussian_normalization_to_coefficients() {
 }
 
 #ifdef USING_cuEST
-cuestAOBasis_t BasisSet::cuest_basis()
+cuestAOBasis_t BasisSet::cuest_basis(bool vxc_context)
 {
-    if (cuest_basis_ == nullptr) {
-        cuest_common::ensure_cuest_initialized();
-        cuest_initialize();
+    const int context_index = vxc_context ? 1 : 0;
+    if (cuest_basis_[context_index] == nullptr) {
+        cuest_initialize(vxc_context);
     }
-    return cuest_basis_;
+    return cuest_basis_[context_index];
 }
 
-void BasisSet::cuest_initialize()
+void BasisSet::cuest_initialize(bool vxc_context)
 {
-    cuest_common::ensure_cuest_initialized();
+    const int context_index = vxc_context ? 1 : 0;
+    cuest_common::ScopedContext context(vxc_context ? cuest_common::Context::Vxc : cuest_common::Context::Default);
+    const cuestHandle_t cuest_handle = context.cuest();
 
     int natom = molecule_->natom();
 
@@ -1355,11 +1348,12 @@ void BasisSet::cuest_initialize()
     CHECK_CUEST(cuestAOBasisCreateWorkspaceQuery(cuest_handle, static_cast<uint64_t>(natom),
         shells_per_atom.data(), shells_out.data(), basis_params, persistentWorkspaceDescriptor, temporaryWorkspaceDescriptor, nullptr));
 
-    cuest_basis_ws_ptr_ = cuest_common::allocateWorkspace(persistentWorkspaceDescriptor);
+    cuest_basis_ws_ptr_[context_index] = cuest_common::allocateWorkspace(persistentWorkspaceDescriptor);
     cuestWorkspace_t* temporaryBasisWorkspace = cuest_common::allocateWorkspace(temporaryWorkspaceDescriptor);
 
     CHECK_CUEST(cuestAOBasisCreate(cuest_handle, static_cast<uint64_t>(natom),
-        shells_per_atom.data(), shells_out.data(), basis_params, cuest_basis_ws_ptr_, temporaryBasisWorkspace, &cuest_basis_));
+        shells_per_atom.data(), shells_out.data(), basis_params, cuest_basis_ws_ptr_[context_index],
+        temporaryBasisWorkspace, &cuest_basis_[context_index]));
 
     cuest_common::freeWorkspace(temporaryBasisWorkspace);
     cuestParametersDestroy(CUEST_AOBASIS_PARAMETERS, basis_params);
@@ -1372,13 +1366,19 @@ void BasisSet::cuest_initialize()
 
 void BasisSet::cuest_finalize()
 {
-    if (cuest_basis_ != nullptr) {
-        cuestAOBasisDestroy(cuest_basis_);
-        cuest_basis_ = nullptr;
-    }
-    if (cuest_basis_ws_ptr_ != nullptr) {
-        cuest_common::freeWorkspace(cuest_basis_ws_ptr_);
-        cuest_basis_ws_ptr_ = nullptr;
+    for (int context_index = 1; context_index >= 0; --context_index) {
+        if (cuest_basis_[context_index] == nullptr && cuest_basis_ws_ptr_[context_index] == nullptr) continue;
+
+        cuest_common::ScopedContext context(context_index == 1 ? cuest_common::Context::Vxc
+                                                               : cuest_common::Context::Default);
+        if (cuest_basis_[context_index] != nullptr) {
+            cuestAOBasisDestroy(cuest_basis_[context_index]);
+            cuest_basis_[context_index] = nullptr;
+        }
+        if (cuest_basis_ws_ptr_[context_index] != nullptr) {
+            cuest_common::freeWorkspace(cuest_basis_ws_ptr_[context_index]);
+            cuest_basis_ws_ptr_[context_index] = nullptr;
+        }
     }
 }
 #endif

@@ -36,9 +36,9 @@
 
 #include <cuest.h>
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <cusolverDn.h>
 
-#include "psi4/libmints/basisset.h"
-#include "psi4/libmints/molecule.h"
 #include "psi4/libpsi4util/exception.h"
 
 #include <cstdlib>
@@ -50,6 +50,33 @@ extern cuestHandle_t cuest_handle;
 
 namespace psi {
 namespace cuest_common {
+
+enum class Context { Default, Vxc };
+
+// Selects the CUDA device associated with a cuEST context for the lifetime of
+// the object and restores the calling thread's previous device on destruction.
+class ScopedContext {
+   public:
+    explicit ScopedContext(Context context);
+    ~ScopedContext() noexcept;
+
+    ScopedContext(const ScopedContext&) = delete;
+    ScopedContext& operator=(const ScopedContext&) = delete;
+
+    cuestHandle_t cuest() const { return cuest_; }
+    cublasHandle_t cublas() const { return cublas_; }
+    cusolverDnHandle_t cusolver() const { return cusolver_; }
+    cudaStream_t stream() const { return stream_; }
+    int device() const { return device_; }
+
+   private:
+    int previous_device_ = -1;
+    int device_ = -1;
+    cuestHandle_t cuest_ = nullptr;
+    cublasHandle_t cublas_ = nullptr;
+    cusolverDnHandle_t cusolver_ = nullptr;
+    cudaStream_t stream_ = nullptr;
+};
 
 void ensure_cuest_initialized();
 

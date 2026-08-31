@@ -58,7 +58,6 @@
 #ifdef USING_cuEST
 #include <cuest.h>
 #include "psi4/libfock/cuESTCommon.h"
-extern cuestHandle_t cuest_handle;
 #endif
 
 #ifdef USING_BrianQC
@@ -3798,7 +3797,8 @@ void MolecularGrid::buildGridFromOptions(MolecularGridOptions const &opt, bool i
 
 #ifdef USING_cuEST
     if (is_cuest) {
-        cuest_common::ensure_cuest_initialized();
+        cuest_common::ScopedContext context(cuest_common::Context::Vxc);
+        const cuestHandle_t cuest_handle = context.cuest();
         cuestAtomGridParameters_t atom_grid_params;
         CHECK_CUEST(cuestParametersCreate(CUEST_ATOMGRID_PARAMETERS, &atom_grid_params));
         uint64_t natom = molecule_->natom();
@@ -4530,13 +4530,16 @@ MolecularGrid::MolecularGrid(std::shared_ptr<Molecule> molecule)
     : debug_(0), molecule_(molecule), npoints_(0), max_points_(0), max_functions_(0) {}
 MolecularGrid::~MolecularGrid() {
 #ifdef USING_cuEST
-    if (cuest_molecular_grid_) {
-        CHECK_CUEST(cuestMolecularGridDestroy(cuest_molecular_grid_));
-        cuest_molecular_grid_ = nullptr;
-    }
-    if (cuest_molecular_grid_ws_ptr_) {
-        cuest_common::freeWorkspace(cuest_molecular_grid_ws_ptr_);
-        cuest_molecular_grid_ws_ptr_ = nullptr;
+    if (cuest_molecular_grid_ || cuest_molecular_grid_ws_ptr_) {
+        cuest_common::ScopedContext context(cuest_common::Context::Vxc);
+        if (cuest_molecular_grid_) {
+            CHECK_CUEST(cuestMolecularGridDestroy(cuest_molecular_grid_));
+            cuest_molecular_grid_ = nullptr;
+        }
+        if (cuest_molecular_grid_ws_ptr_) {
+            cuest_common::freeWorkspace(cuest_molecular_grid_ws_ptr_);
+            cuest_molecular_grid_ws_ptr_ = nullptr;
+        }
     }
 #endif
     if (npoints_) {

@@ -49,6 +49,7 @@
 
 #include <sstream>
 #include <string>
+#include <mutex>
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -59,6 +60,7 @@
 #include "psi4/libfock/cuESTCommon.h"
 #include "psi4/libpsi4util/PsiOutStream.h"
 #include "psi4/libpsi4util/exception.h"
+#include "psi4/libpsi4util/process.h"
 
 #include "cuest_runtime.h"
 
@@ -81,26 +83,44 @@ cudaStream_t stream_handle = 0;
 
 namespace {
 
+cusolverDnHandle_t vxc_cusolver_handle = 0;
+cublasHandle_t vxc_cublas_handle = 0;
+cuestHandle_t vxc_cuest_handle = 0;
+cudaStream_t vxc_stream_handle = 0;
+
+std::mutex initialization_mutex;
+bool runtime_configured = false;
+int configured_num_gpus = 1;
+int default_device_id = -1;
+int vxc_device_id = -1;
+
 // Tear down whatever is up, in reverse order of creation, swallowing errors.
 // Used both for the ordinary shutdown path and to unwind a partially completed
 // initialization.
-void cuest_cleanup_noexcept() {
-    if (cuest_handle != 0) {
-        cuestDestroy(cuest_handle);
-        cuest_handle = 0;
+void cuest_cleanup_noexcept(int device_id, cuestHandle_t& cuest, cusolverDnHandle_t& cusolver,
+                            cublasHandle_t& cublas, cudaStream_t& stream) {
+    int previous_device = -1;
+    cudaGetDevice(&previous_device);
+    if (device_id >= 0) cudaSetDevice(device_id);
+
+    if (cuest != 0) {
+        cuestDestroy(cuest);
+        cuest = 0;
     }
-    if (cusolver_handle != 0) {
-        cusolverDnDestroy(cusolver_handle);
-        cusolver_handle = 0;
+    if (cusolver != 0) {
+        cusolverDnDestroy(cusolver);
+        cusolver = 0;
     }
-    if (cublas_handle != 0) {
-        cublasDestroy(cublas_handle);
-        cublas_handle = 0;
+    if (cublas != 0) {
+        cublasDestroy(cublas);
+        cublas = 0;
     }
-    if (stream_handle != 0) {
-        cudaStreamDestroy(stream_handle);
-        stream_handle = 0;
+    if (stream != 0) {
+        cudaStreamDestroy(stream);
+        stream = 0;
     }
+
+    if (previous_device >= 0 && previous_device != device_id) cudaSetDevice(previous_device);
 }
 
 // Some CUDA status codes mean "this GPU or this node is broken/misprovisioned",
@@ -213,45 +233,15 @@ std::string describe_cuda_device(int device_id, const cudaDeviceProp& props) {
     return desc.str();
 }
 
-// Bring up CUDA/cuBLAS/cuSOLVER/cuEST on the current device. Only ever reached
-// through ensure_cuest_initialized(), i.e. from the first computation that
-// actually wants cuEST -- never at import time.
-void cuest_init() {
-    if (stream_handle != 0) {
-        throw PSIEXCEPTION("Attempting to reinitialize the stream_handle when it hasn't been released\n");
-    }
-    if (cublas_handle != 0) {
-        throw PSIEXCEPTION("Attempting to reinitialize the cublas_handle when it hasn't been released\n");
-    }
-    if (cusolver_handle != 0) {
-        throw PSIEXCEPTION("Attempting to reinitialize the cusolver_handle when it hasn't been released\n");
-    }
-    if (cuest_handle != 0) {
-        throw PSIEXCEPTION("Attempting to reinitialize the cuEST module when it hasn't been released\n");
-    }
-
-    int device_count = 0;
-    cudaError_t cuda_err = cudaGetDeviceCount(&device_count);
-    if (cuda_err != cudaSuccess) {
-        throw PSIEXCEPTION(cuda_failure_message("cuEST requested, but CUDA device discovery failed", cuda_err));
-    }
-    if (device_count == 0) {
-        throw PSIEXCEPTION("cuEST requested, but no CUDA-capable GPU was found.");
-    }
-
-    int device_id = 0;
-    cuda_err = cudaGetDevice(&device_id);
-    if (cuda_err != cudaSuccess) {
-        throw PSIEXCEPTION(cuda_failure_message("cuEST requested, but cudaGetDevice failed", cuda_err));
-    }
+void validate_device(int device_id, int device_count) {
     if (device_id < 0 || device_id >= device_count) {
         throw PSIEXCEPTION("cuEST requested, but CUDA reported an invalid active device.");
     }
 
     cudaDeviceProp props;
-    cuda_err = cudaGetDeviceProperties(&props, device_id);
-    if (cuda_err != cudaSuccess) {
-        throw PSIEXCEPTION(cuda_failure_message("cuEST requested, but cudaGetDeviceProperties failed", cuda_err));
+    const cudaError_t props_err = cudaGetDeviceProperties(&props, device_id);
+    if (props_err != cudaSuccess) {
+        throw PSIEXCEPTION(cuda_failure_message("cuEST requested, but cudaGetDeviceProperties failed", props_err));
     }
     if (props.major < 8) {
         std::ostringstream msg;
@@ -259,72 +249,136 @@ void cuest_init() {
             << props.name << ") has compute capability " << props.major << "." << props.minor << ".";
         throw PSIEXCEPTION(msg.str());
     }
+}
 
-    // Unlike the failure paths above, nothing previously reported which GPU
-    // was actually selected on success. On a multi-GPU node this is the only
-    // thing that tells a user (short of externally polling nvidia-smi) which
-    // physical device cuEST landed on -- e.g. via CUDA_VISIBLE_DEVICES/the
-    // job scheduler, cuEST always uses whichever is "the current device"
-    // (logical index 0 by default) and never scans device_count for others.
-    outfile->Printf("  cuEST initializing on GPU device %d of %d visible (%s), compute capability %d.%d\n",
-                    device_id, device_count, props.name, props.major, props.minor);
+void configure_runtime() {
+    if (runtime_configured) return;
 
-    // Everything below this point can fail partway through (CUDA, cuBLAS,
-    // cuSOLVER, or cuEST's own CHECK_CUEST-wrapped calls). Any such failure
-    // must not leave stream_handle/cublas_handle/cusolver_handle non-null
-    // while cuest_handle stays null -- that combination would permanently
-    // "poison" cuest_init() for the rest of the process, since the
-    // reinitialize guards at the top of this function would trip on the very
-    // next attempt even after what may have been a transient failure.
+    int device_count = 0;
+    const cudaError_t cuda_err = cudaGetDeviceCount(&device_count);
+    if (cuda_err != cudaSuccess) {
+        throw PSIEXCEPTION(cuda_failure_message("cuEST requested, but CUDA device discovery failed", cuda_err));
+    }
+    if (device_count == 0) {
+        throw PSIEXCEPTION("cuEST requested, but no CUDA-capable GPU was found.");
+    }
+
+    configured_num_gpus = Process::environment.options.get_int("CUEST_NUM_GPUS");
+    if (configured_num_gpus != 1 && configured_num_gpus != 2) {
+        throw PSIEXCEPTION("CUEST_NUM_GPUS must be either 1 or 2.");
+    }
+    if (configured_num_gpus > device_count) {
+        throw PSIEXCEPTION("The number of GPUs requested by CUEST_NUM_GPUS exceeds the number available.");
+    }
+
+    if (configured_num_gpus == 2) {
+        default_device_id = 0;
+        vxc_device_id = 1;
+    } else {
+        cudaError_t current_err = cudaGetDevice(&default_device_id);
+        if (current_err != cudaSuccess) {
+            throw PSIEXCEPTION(cuda_failure_message("cuEST requested, but cudaGetDevice failed", current_err));
+        }
+        vxc_device_id = default_device_id;
+    }
+
+    validate_device(default_device_id, device_count);
+    if (vxc_device_id != default_device_id) validate_device(vxc_device_id, device_count);
+    runtime_configured = true;
+}
+
+void initialize_context(int device_id, const char* role, cuestHandle_t& cuest, cusolverDnHandle_t& cusolver,
+                        cublasHandle_t& cublas, cudaStream_t& stream) {
+    if (cuest != 0) return;
+    if (stream != 0 || cublas != 0 || cusolver != 0) {
+        throw PSIEXCEPTION("Attempting to initialize a partially active cuEST context.");
+    }
+
+    const cudaError_t set_device_err = cudaSetDevice(device_id);
+    if (set_device_err != cudaSuccess) {
+        throw PSIEXCEPTION(cuda_failure_message("cudaSetDevice failed in cuest_init", set_device_err));
+    }
+
+    cudaDeviceProp props;
+    const cudaError_t props_err = cudaGetDeviceProperties(&props, device_id);
+    if (props_err != cudaSuccess) {
+        throw PSIEXCEPTION(cuda_failure_message("cudaGetDeviceProperties failed in cuest_init", props_err));
+    }
+    outfile->Printf("  cuEST initializing %s context on GPU device %d (%s), compute capability %d.%d\n", role,
+                    device_id, props.name, props.major, props.minor);
+
+    cuestHandleParameters_t handle_parameters = nullptr;
     try {
-        // First call that actually establishes a CUDA context on the device, so
-        // this is where a sick GPU (bad ECC, exclusive-mode contention, driver
-        // mismatch) reveals itself -- the pure query calls above can all succeed
-        // on hardware that can no longer run anything.
-        cudaError_t stream_err = cudaStreamCreate(&stream_handle);
+        const cudaError_t stream_err = cudaStreamCreate(&stream);
         if (stream_err != cudaSuccess) {
             throw PSIEXCEPTION(cuda_failure_message("cudaStreamCreate failed in cuest_init", stream_err,
-                                                    describe_cuda_device(device_id, props)));
+                                                     describe_cuda_device(device_id, props)));
         }
-        cublasStatus_t cublas_status = cublasCreate(&cublas_handle);
+        const cublasStatus_t cublas_status = cublasCreate(&cublas);
         if (cublas_status != CUBLAS_STATUS_SUCCESS) {
             throw PSIEXCEPTION("cublasCreate failed in cuest_init");
         }
-        cusolverStatus_t cusolver_status = cusolverDnCreate(&cusolver_handle);
+        const cusolverStatus_t cusolver_status = cusolverDnCreate(&cusolver);
         if (cusolver_status != CUSOLVER_STATUS_SUCCESS) {
             throw PSIEXCEPTION("cusolverDnCreate failed in cuest_init");
         }
-        cublasSetStream(cublas_handle, stream_handle);
-        cusolverDnSetStream(cusolver_handle, stream_handle);
-        // Declare & create the cuEST parameters and handle with reasonable defaults. Destroy param promptly.
-        cuestHandleParameters_t handle_parameters;
+        if (cublasSetStream(cublas, stream) != CUBLAS_STATUS_SUCCESS) {
+            throw PSIEXCEPTION("cublasSetStream failed in cuest_init");
+        }
+        if (cusolverDnSetStream(cusolver, stream) != CUSOLVER_STATUS_SUCCESS) {
+            throw PSIEXCEPTION("cusolverDnSetStream failed in cuest_init");
+        }
         CHECK_CUEST(cuestParametersCreate(CUEST_HANDLE_PARAMETERS, &handle_parameters));
         CHECK_CUEST(cuestParametersConfigure(
             CUEST_HANDLE_PARAMETERS,
             handle_parameters,
             CUEST_HANDLE_PARAMETERS_CUDASTREAM,
-            &stream_handle,
-            sizeof(stream_handle)
+            &stream,
+            sizeof(stream)
         ));
         CHECK_CUEST(cuestParametersConfigure(
             CUEST_HANDLE_PARAMETERS,
             handle_parameters,
             CUEST_HANDLE_PARAMETERS_CUBLAS,
-            &cublas_handle,
-            sizeof(cublas_handle)
+            &cublas,
+            sizeof(cublas)
         ));
         CHECK_CUEST(cuestParametersConfigure(
             CUEST_HANDLE_PARAMETERS,
             handle_parameters,
             CUEST_HANDLE_PARAMETERS_CUSOLVER,
-            &cusolver_handle,
-            sizeof(cusolver_handle)
+            &cusolver,
+            sizeof(cusolver)
         ));
-        CHECK_CUEST(cuestCreate(handle_parameters, &cuest_handle));
+        CHECK_CUEST(cuestCreate(handle_parameters, &cuest));
         CHECK_CUEST(cuestParametersDestroy(CUEST_HANDLE_PARAMETERS, handle_parameters));
+        handle_parameters = nullptr;
     } catch (...) {
-        cuest_cleanup_noexcept();
+        if (handle_parameters != nullptr) cuestParametersDestroy(CUEST_HANDLE_PARAMETERS, handle_parameters);
+        cuest_cleanup_noexcept(device_id, cuest, cusolver, cublas, stream);
         throw;
+    }
+}
+
+void select_context(cuest_common::Context context, int& device_id, cuestHandle_t& cuest,
+                    cusolverDnHandle_t& cusolver, cublasHandle_t& cublas, cudaStream_t& stream) {
+    configure_runtime();
+    const bool separate_vxc = context == cuest_common::Context::Vxc && configured_num_gpus == 2;
+    if (separate_vxc) {
+        device_id = vxc_device_id;
+        initialize_context(device_id, "Vxc", vxc_cuest_handle, vxc_cusolver_handle, vxc_cublas_handle,
+                           vxc_stream_handle);
+        cuest = vxc_cuest_handle;
+        cusolver = vxc_cusolver_handle;
+        cublas = vxc_cublas_handle;
+        stream = vxc_stream_handle;
+    } else {
+        device_id = default_device_id;
+        initialize_context(device_id, "default", cuest_handle, cusolver_handle, cublas_handle, stream_handle);
+        cuest = cuest_handle;
+        cusolver = cusolver_handle;
+        cublas = cublas_handle;
+        stream = stream_handle;
     }
 }
 
@@ -334,11 +388,40 @@ namespace psi {
 
 namespace cuest_common {
 
+ScopedContext::ScopedContext(Context context) {
+    try {
+        std::lock_guard<std::mutex> lock(initialization_mutex);
+        configure_runtime();
+        const cudaError_t current_err = cudaGetDevice(&previous_device_);
+        if (current_err != cudaSuccess) {
+            throw PSIEXCEPTION(cuda_failure_message("cuEST requested, but cudaGetDevice failed", current_err));
+        }
+        select_context(context, device_, cuest_, cusolver_, cublas_, stream_);
+        const cudaError_t set_device_err = cudaSetDevice(device_);
+        if (set_device_err != cudaSuccess) {
+            throw PSIEXCEPTION(cuda_failure_message("cudaSetDevice failed while selecting a cuEST context",
+                                                    set_device_err));
+        }
+    } catch (...) {
+        if (previous_device_ >= 0) cudaSetDevice(previous_device_);
+        throw;
+    }
+}
+
+ScopedContext::~ScopedContext() noexcept {
+    if (previous_device_ >= 0 && previous_device_ != device_) cudaSetDevice(previous_device_);
+}
+
 // Declared in libfock/cuESTCommon.h and called from every cuEST entry point.
 void ensure_cuest_initialized() {
-    if (cuest_handle == 0) {
-        cuest_init();
-    }
+    std::lock_guard<std::mutex> lock(initialization_mutex);
+    int device_id;
+    cuestHandle_t cuest;
+    cusolverDnHandle_t cusolver;
+    cublasHandle_t cublas;
+    cudaStream_t stream;
+    select_context(Context::Default, device_id, cuest, cusolver, cublas, stream);
+    cudaSetDevice(device_id);
 }
 
 }  // namespace cuest_common
@@ -346,11 +429,10 @@ void ensure_cuest_initialized() {
 namespace cuest_runtime {
 
 void shutdown() {
-    // No-op when cuEST was never brought up: a machine without a GPU, or a run
-    // that simply never asked for cuEST, ends here with all four handles still
-    // zero.
-    if (cuest_handle == 0) return;
-    cuest_cleanup_noexcept();
+    std::lock_guard<std::mutex> lock(initialization_mutex);
+    cuest_cleanup_noexcept(vxc_device_id, vxc_cuest_handle, vxc_cusolver_handle, vxc_cublas_handle,
+                           vxc_stream_handle);
+    cuest_cleanup_noexcept(default_device_id, cuest_handle, cusolver_handle, cublas_handle, stream_handle);
 }
 
 }  // namespace cuest_runtime
