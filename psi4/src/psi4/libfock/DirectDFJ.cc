@@ -312,10 +312,12 @@ void DirectDFJ::build_G_component(std::vector<std::shared_ptr<Matrix>>& D, std::
 
     num_computed_shells_ = computed_triplets1 + computed_triplets2;
 
+    // To avoid roundoff error, accumulate contributions into thread 0 buffer
     for(size_t jki = 0; jki < njk; jki++) {
-        for (size_t thread = 0; thread < nthreads_; thread++) {
-            J[jki]->add(JT[jki][thread]);
+        for (size_t thread = 1; thread < nthreads_; thread++) {
+            JT[jki][0]->add(JT[jki][thread]);
         }
+        J[jki]->add(JT[jki][0]);
         J[jki]->hermitivitize();
     }
 
