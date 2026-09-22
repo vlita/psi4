@@ -160,6 +160,8 @@ class PSI_API DirectDFJ : public SplitJK {
     std::shared_ptr<BasisSet> auxiliary_;
     /// Coulomb Metric
     SharedMatrix J_metric_;
+    /// Conditioned inverse Coulomb metric
+    SharedMatrix J_metric_inv_;
 
    public:
     // => Constructors < = //

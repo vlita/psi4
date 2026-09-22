@@ -64,6 +64,8 @@ DirectDFJ::DirectDFJ(std::shared_ptr<BasisSet> primary, std::shared_ptr<BasisSet
     FittingMetric J_metric_obj(auxiliary_, true);
     J_metric_obj.form_fitting_metric();
     J_metric_ = J_metric_obj.get_metric();
+    J_metric_inv_ = J_metric_->clone();
+    J_metric_inv_->power(-1.0, options_.get_double("DF_FITTING_CONDITION"));
 
     timer_off("DirectDFJ: DIRECTDFJ Coulomb Metric");
 
@@ -213,28 +215,17 @@ void DirectDFJ::build_G_component(std::vector<std::shared_ptr<Matrix>>& D, std::
 
     //  => Second Contraction <= //
 
-    //  linear solve for H:
-    //  G_{p} = H_{q} (q|p)
-    //  H_{p} correlates to gamma_Q in Figure 1 of Weigend's paper
+    // Apply the conditioned inverse metric: H_q = (q|p)^-1 G_p.
+    // H_q correlates to gamma_Q in Figure 1 of Weigend's paper.
 
     timer_on("Metric");
-
-    std::vector<int> ipiv(nbf_aux);
 
     for(size_t jki = 0; jki < njk; jki++) {
         for(size_t thread = 0; thread < nthreads_; thread++) {
             H[jki]->add(*GT[jki][thread]);
         }
-        C_DGESV(nbf_aux, 1, J_metric_->clone()->pointer()[0], nbf_aux, ipiv.data(), H[jki]->pointer(), nbf_aux);
+        H[jki] = J_metric_inv_->gemv(false, 1.0, *H[jki]);
     }
-
-
-    // I believe C_DSYSV should be faster than C_GESV, but I've found the opposite to be true.
-    // This performance issue should be investigated, but is not consequential here.
-    // The cost of either linear solve is dwarfed by the actual integral computation.
-    //
-    //std::vector<double> work(3 * nbf_aux);
-    //int errcode = C_DSYSV('U', nbf_aux, 1, J_metric_->clone()->pointer()[0], nbf_aux, ipiv.data(), H[jki]->pointer(), nbf_aux, work.data(), 3 * nbf_aux);
 
     // shell maxima of H for screening
     Vector H_shell_max(nshell_aux);
