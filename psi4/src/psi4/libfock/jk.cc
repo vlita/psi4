@@ -170,7 +170,7 @@ std::shared_ptr<JK> JK::build_JK(std::shared_ptr<BasisSet> primary, std::shared_
         return jk;
 
     } else if (jk_type == "DIRECT") {
-        auto jk = std::make_shared<DirectJK>(primary, options);
+        auto jk = std::make_shared<DirectJK>(primary, options, auxiliary);
         if (options["INTS_TOLERANCE"].has_changed() || options.get_str("SCREENING") == "NONE") jk->set_cutoff(cutoff);
 
         if (options["SCREENING"].has_changed()) jk->set_csam(options.get_str("SCREENING") == "CSAM");

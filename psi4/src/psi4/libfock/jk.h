@@ -725,6 +725,10 @@ class PSI_API PKJK : public JK {
  */
 class PSI_API DirectJK : public JK {
    protected:
+    /// Optional DF-DirJ Coulomb builder (the exchange build remains integral-direct).
+    std::shared_ptr<BasisSet> auxiliary_;
+    std::shared_ptr<DirectDFJ> df_j_algo_;
+    std::vector<std::shared_ptr<TwoBodyAOInt>> df_j_ints_;
     /// Number of threads for DF integrals TODO: DF_INTS_NUM_THREADS
     int df_ints_num_threads_;
     /// ERI Sieve
@@ -807,7 +811,7 @@ class PSI_API DirectJK : public JK {
      *        C matrices must have the same spatial symmetry
      *        structure as this molecule
      */
-    DirectJK(std::shared_ptr<BasisSet> primary, Options& options);
+    DirectJK(std::shared_ptr<BasisSet> primary, Options& options, std::shared_ptr<BasisSet> auxiliary = nullptr);
     /// Destructor
     ~DirectJK() override;
 
@@ -1355,4 +1359,3 @@ class PSI_API CompositeJK : public JK {
 }
 
 #endif
-

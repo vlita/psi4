@@ -76,7 +76,8 @@ using namespace psi;
 
 namespace psi {
 
-DirectJK::DirectJK(std::shared_ptr<BasisSet> primary, Options& options) : JK(primary), options_(options) { common_init(); }
+DirectJK::DirectJK(std::shared_ptr<BasisSet> primary, Options& options, std::shared_ptr<BasisSet> auxiliary)
+    : JK(primary), auxiliary_(auxiliary), options_(options) { common_init(); }
 DirectJK::~DirectJK() {}
 void DirectJK::common_init() {
     df_ints_num_threads_ = 1;
@@ -112,7 +113,7 @@ void DirectJK::print_header() const {
     if (print_) {
         outfile->Printf("  ==> DirectJK: Integral-Direct J/K Matrices <==\n\n");
 
-        outfile->Printf("    J tasked:          %11s\n", (do_J_ ? "Yes" : "No"));
+        outfile->Printf("    J tasked:          %11s\n", (do_J_ ? (df_j_algo_ ? "DF-DirJ" : "Yes") : "No"));
         outfile->Printf("    K tasked:          %11s\n", (do_K_ ? "Yes" : "No"));
         outfile->Printf("    wK tasked:         %11s\n", (do_wK_ ? "Yes" : "No"));
         if (do_wK_) outfile->Printf("    Omega:             %11.3E\n", omega_);
@@ -129,6 +130,22 @@ void DirectJK::preiterations() {
     J_delta_.clear();
     K_delta_.clear();
     wK_delta_.clear();
+
+    if (auxiliary_ && auxiliary_->nbf()) {
+        df_j_algo_ = std::make_shared<DirectDFJ>(primary_, auxiliary_, options_);
+        // DirectDFJ uses the environment thread count, independent of DF_INTS_NUM_THREADS.
+        int j_threads = 1;
+#ifdef _OPENMP
+        j_threads = Process::environment.get_n_threads();
+#endif
+        df_j_ints_.resize(j_threads);
+        IntegralFactory factory(auxiliary_, BasisSet::zero_ao_basis_set(), primary_, primary_);
+        df_j_ints_[0] = std::shared_ptr<TwoBodyAOInt>(factory.eri());
+        if (!df_j_ints_[0]->sieve_initialized()) df_j_ints_[0]->initialize_sieve();
+        for (int thread = 1; thread < j_threads; ++thread) {
+            df_j_ints_[thread] = std::shared_ptr<TwoBodyAOInt>(df_j_ints_[0]->clone());
+        }
+    }
     
 #ifdef USING_BrianQC
     if (brianEnable) {
@@ -402,19 +419,27 @@ void DirectJK::compute_JK() {
         build_JK_matrices(ints, D_ref_, temp, wK_out);
     }
 
-    if (do_J_ || do_K_) {
+    if ((do_J_ && !df_j_algo_) || do_K_) {
         std::vector<std::shared_ptr<TwoBodyAOInt>> ints;
         ints.push_back(std::shared_ptr<TwoBodyAOInt>(factory->eri()));
         if (density_screening_) ints[0]->update_density(D_ref_);
         for (int thread = 1; thread < df_ints_num_threads_; thread++) {
             ints.push_back(std::shared_ptr<TwoBodyAOInt>(ints[0]->clone()));
         }
-        if (do_J_ && do_K_) {
+        if (do_J_ && !df_j_algo_ && do_K_) {
             build_JK_matrices(ints, D_ref_, J_out, K_out);
-        } else if (do_J_) {
+        } else if (do_J_ && !df_j_algo_) {
             build_JK_matrices(ints, D_ref_, J_out, temp);
         } else {
             build_JK_matrices(ints, D_ref_, temp, K_out);
+        }
+    }
+
+    if (do_J_ && df_j_algo_) {
+        df_j_algo_->set_lr_symmetric(lr_symmetric_);
+        df_j_algo_->build_G_component(D_ref_, J_out, df_j_ints_);
+        if (get_bench()) {
+            computed_shells_per_iter_["Triplets"].push_back(df_j_algo_->num_computed_shells());
         }
     }
 
@@ -438,7 +463,10 @@ void DirectJK::compute_JK() {
 
     if (initial_iteration_) initial_iteration_ = false;
 }
-void DirectJK::postiterations() {}
+void DirectJK::postiterations() {
+    df_j_ints_.clear();
+    df_j_algo_.reset();
+}
 
 void DirectJK::build_JK_matrices(std::vector<std::shared_ptr<TwoBodyAOInt>>& ints, const std::vector<SharedMatrix>& D,
                         std::vector<SharedMatrix>& J, std::vector<SharedMatrix>& K) {
