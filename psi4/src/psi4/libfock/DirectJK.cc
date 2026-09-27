@@ -113,7 +113,8 @@ void DirectJK::print_header() const {
         outfile->Printf("  ==> DirectJK: Integral-Direct J/K Matrices <==\n\n");
 
         outfile->Printf("    J tasked:          %11s\n", (do_J_ ? "Yes" : "No"));
-        outfile->Printf("    K tasked:          %11s\n", (do_K_ ? "Yes" : "No"));
+        outfile->Printf("    K tasked:          %11s\n", (do_K_ ? "LinK" : "No"));
+        if (do_K_) outfile->Printf("    Non-symmetric K:   %11s\n", "Direct");
         outfile->Printf("    wK tasked:         %11s\n", (do_wK_ ? "Yes" : "No"));
         if (do_wK_) outfile->Printf("    Omega:             %11.3E\n", omega_);
         outfile->Printf("    Integrals threads: %11d\n", df_ints_num_threads_);
@@ -129,6 +130,8 @@ void DirectJK::preiterations() {
     J_delta_.clear();
     K_delta_.clear();
     wK_delta_.clear();
+
+    link_algo_ = std::make_shared<LinK>(primary_, options_);
     
 #ifdef USING_BrianQC
     if (brianEnable) {
@@ -402,19 +405,37 @@ void DirectJK::compute_JK() {
         build_JK_matrices(ints, D_ref_, temp, wK_out);
     }
 
+    bool use_link = do_K_ && lr_symmetric_;
     if (do_J_ || do_K_) {
         std::vector<std::shared_ptr<TwoBodyAOInt>> ints;
         ints.push_back(std::shared_ptr<TwoBodyAOInt>(factory->eri()));
-        if (density_screening_) ints[0]->update_density(D_ref_);
-        for (int thread = 1; thread < df_ints_num_threads_; thread++) {
+        if (use_link && !ints[0]->sieve_initialized()) ints[0]->initialize_sieve();
+        int nthreads = df_ints_num_threads_;
+#ifdef _OPENMP
+        if (use_link) nthreads = std::max(nthreads, Process::environment.get_n_threads());
+#endif
+        for (int thread = 1; thread < nthreads; thread++) {
             ints.push_back(std::shared_ptr<TwoBodyAOInt>(ints[0]->clone()));
         }
-        if (do_J_ && do_K_) {
+        // LinK's screening needs the density even when SCREENING is not DENSITY.
+        if (density_screening_ || use_link) {
+            for (auto& eri : ints) eri->update_density(D_ref_);
+        }
+        if (do_J_ && do_K_ && !use_link) {
             build_JK_matrices(ints, D_ref_, J_out, K_out);
         } else if (do_J_) {
             build_JK_matrices(ints, D_ref_, J_out, temp);
-        } else {
+        } else if (!use_link) {
             build_JK_matrices(ints, D_ref_, temp, K_out);
+        }
+
+        if (use_link) {
+            link_algo_->set_lr_symmetric(lr_symmetric_);
+            link_algo_->build_G_component(D_ref_, K_out, ints);
+            num_computed_shells_ = (do_J_ ? num_computed_shells_ : 0) + link_algo_->num_computed_shells();
+            if (get_bench()) {
+                computed_shells_per_iter_["LinK Quartets"].push_back(link_algo_->num_computed_shells());
+            }
         }
     }
 
@@ -438,7 +459,7 @@ void DirectJK::compute_JK() {
 
     if (initial_iteration_) initial_iteration_ = false;
 }
-void DirectJK::postiterations() {}
+void DirectJK::postiterations() { link_algo_.reset(); }
 
 void DirectJK::build_JK_matrices(std::vector<std::shared_ptr<TwoBodyAOInt>>& ints, const std::vector<SharedMatrix>& D,
                         std::vector<SharedMatrix>& J, std::vector<SharedMatrix>& K) {

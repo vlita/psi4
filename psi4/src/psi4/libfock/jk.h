@@ -725,6 +725,8 @@ class PSI_API PKJK : public JK {
  */
 class PSI_API DirectJK : public JK {
    protected:
+    /// LinK handles symmetric exchange builds; direct K handles non-symmetric ones.
+    std::shared_ptr<LinK> link_algo_;
     /// Number of threads for DF integrals TODO: DF_INTS_NUM_THREADS
     int df_ints_num_threads_;
     /// ERI Sieve
@@ -1355,4 +1357,3 @@ class PSI_API CompositeJK : public JK {
 }
 
 #endif
-
