@@ -40,6 +40,7 @@
 #include <cublas_v2.h>
 #include <cusolverDn.h>
 extern cusolverDnHandle_t cusolver_handle;
+#include "psi4/libfock/cuESTTransferTimer.h"
 #endif
 
 // Helper macro for brevity (you may want a nicer error handler)
@@ -119,7 +120,7 @@ namespace {
     CHECK_CUDA(cudaMalloc((void**)&d_info, sizeof(int)));
 
     // 4. Copy matrix to device
-    CHECK_CUDA(cudaMemcpy(d_A, h_A.data(),
+    CHECK_CUDA(cuest_common::timed_memcpy(d_A, h_A.data(),
                           sizeof(double) * N * N,
                           cudaMemcpyHostToDevice));
 
@@ -153,7 +154,7 @@ namespace {
 
     // 7. Copy info and eigenvalues back
     int info = 0;
-    CHECK_CUDA(cudaMemcpy(&info, d_info, sizeof(int), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cuest_common::timed_memcpy(&info, d_info, sizeof(int), cudaMemcpyDeviceToHost));
     if (info != 0) {
         // Clean up and return LAPACK-style error code
         cudaFree(d_A);
@@ -163,14 +164,14 @@ namespace {
         return info;
     }
 
-    CHECK_CUDA(cudaMemcpy(e_vals, d_W,
+    CHECK_CUDA(cuest_common::timed_memcpy(e_vals, d_W,
                           sizeof(double) * N,
                           cudaMemcpyDeviceToHost));
 
     // 8. If eigenvectors requested, copy them back and reorder to row-major
     if (e_vecs) {
         std::vector<double> h_V(N * N);
-        CHECK_CUDA(cudaMemcpy(h_V.data(), d_A,
+        CHECK_CUDA(cuest_common::timed_memcpy(h_V.data(), d_A,
                               sizeof(double) * N * N,
                               cudaMemcpyDeviceToHost));
         // h_V is column-major: columns = eigenvectors

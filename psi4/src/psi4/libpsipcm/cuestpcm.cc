@@ -285,7 +285,7 @@ SharedMatrix cuestPCM::compute_PCM_gradient(const SharedMatrix &D) {
 
     // Copy the density matrix to the device
     int nbf = mintshelper_->basisset()->nbf();
-    err = cudaMemcpy(d_D_matrix_, D->pointer()[0], nbf * nbf * sizeof(double), cudaMemcpyHostToDevice);
+    err = cuest_common::timed_memcpy(d_D_matrix_, D->pointer()[0], nbf * nbf * sizeof(double), cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         throw PSIEXCEPTION("cudaMemcpy failed in cuestPCM::compute_PCM_terms");
     }
@@ -322,7 +322,7 @@ SharedMatrix cuestPCM::compute_PCM_gradient(const SharedMatrix &D) {
     CHECK_CUEST(cuestResultsDestroy(CUEST_PCM_RESULTS, pcm_results));
 
     // Copy the gradient matrix to the host
-    err = cudaMemcpy(grad->get_pointer(0), d_V_gradient_matrix, natom * 3 * sizeof(double), cudaMemcpyDeviceToHost);
+    err = cuest_common::timed_memcpy(grad->get_pointer(0), d_V_gradient_matrix, natom * 3 * sizeof(double), cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
         throw PSIEXCEPTION("cudaMemcpy failed in cuestPCM::compute_PCM_gradient");
     }
@@ -340,7 +340,7 @@ std::pair<double, SharedMatrix> cuestPCM::compute_PCM_terms(const SharedMatrix &
 
     // Copy the density matrix to the device
     int nbf = mintshelper_->basisset()->nbf();
-    cudaError_t err = cudaMemcpy(d_D_matrix_, D->pointer()[0], nbf * nbf * sizeof(double), cudaMemcpyHostToDevice);
+    cudaError_t err = cuest_common::timed_memcpy(d_D_matrix_, D->pointer()[0], nbf * nbf * sizeof(double), cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         throw PSIEXCEPTION("cudaMemcpy failed in cuestPCM::compute_PCM_terms");
     }
@@ -391,7 +391,7 @@ std::pair<double, SharedMatrix> cuestPCM::compute_PCM_terms(const SharedMatrix &
 
     // Copy the potential matrix to the host
     SharedMatrix V = D->clone();
-    err = cudaMemcpy(V->pointer()[0], d_V_matrix_, nbf * nbf * sizeof(double), cudaMemcpyDeviceToHost);
+    err = cuest_common::timed_memcpy(V->pointer()[0], d_V_matrix_, nbf * nbf * sizeof(double), cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
         throw PSIEXCEPTION("cudaMemcpy failed in cuestPCM::compute_PCM_terms");
     }

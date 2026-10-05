@@ -3206,7 +3206,7 @@ void cuESTJKGrad::compute_gradient() {
 
     double* d_D = nullptr;
     cudaMalloc(reinterpret_cast<void**>(&d_D), sizeof(double) * nao * nao);
-    cudaMemcpy(d_D, Dt_->get_pointer(), sizeof(double) * nao * nao, cudaMemcpyHostToDevice);
+    cuest_common::timed_memcpy(d_D, Dt_->get_pointer(), sizeof(double) * nao * nao, cudaMemcpyHostToDevice);
 
     cuestWorkspaceDescriptor_t* temporaryWorkspaceDescriptor = (cuestWorkspaceDescriptor_t*) malloc(sizeof(cuestWorkspaceDescriptor_t));
     cuestWorkspaceDescriptor_t* variableBufferSize = (cuestWorkspaceDescriptor_t*) malloc(sizeof(cuestWorkspaceDescriptor_t));
@@ -3229,7 +3229,7 @@ void cuESTJKGrad::compute_gradient() {
 
         double* d_C = nullptr;
         cudaMalloc(reinterpret_cast<void**>(&d_C), sizeof(double) * na * nao);
-        cudaMemcpy(d_C, Ca_row_major.data(), sizeof(double) * na * nao, cudaMemcpyHostToDevice);
+        cuest_common::timed_memcpy(d_C, Ca_row_major.data(), sizeof(double) * na * nao, cudaMemcpyHostToDevice);
 
         std::shared_ptr<cuESTJK> cuest_jk = std::dynamic_pointer_cast<cuESTJK>(jk_);
         cuestDFIntPlan_t cuest_df_plan = cuest_jk->cuest_df_plan();
@@ -3284,8 +3284,8 @@ void cuESTJKGrad::compute_gradient() {
 
         double* d_C = nullptr;
         cudaMalloc(reinterpret_cast<void**>(&d_C), sizeof(double) * (na + nb) * nao);
-        cudaMemcpy(d_C, Ca_row_major.data(), sizeof(double) * na * nao, cudaMemcpyHostToDevice);
-        cudaMemcpy(d_C + na * nao, Cb_row_major.data(), sizeof(double) * nb * nao, cudaMemcpyHostToDevice);
+        cuest_common::timed_memcpy(d_C, Ca_row_major.data(), sizeof(double) * na * nao, cudaMemcpyHostToDevice);
+        cuest_common::timed_memcpy(d_C + na * nao, Cb_row_major.data(), sizeof(double) * nb * nao, cudaMemcpyHostToDevice);
 
         std::shared_ptr<cuESTJK> cuest_jk = std::dynamic_pointer_cast<cuESTJK>(jk_);
         cuestDFIntPlan_t cuest_df_plan = cuest_jk->cuest_df_plan();
@@ -3326,7 +3326,7 @@ void cuESTJKGrad::compute_gradient() {
     free(temporaryWorkspaceDescriptor);
     free(variableBufferSize);
 
-    cudaMemcpy(gradients_["Coulomb"]->get_pointer(), d_grad, sizeof(double) * natom * 3, cudaMemcpyDeviceToHost);
+    cuest_common::timed_memcpy(gradients_["Coulomb"]->get_pointer(), d_grad, sizeof(double) * natom * 3, cudaMemcpyDeviceToHost);
 
     CHECK_CUEST(cuestParametersDestroy(
         CUEST_DFSYMMETRICDERIVATIVECOMPUTE_PARAMETERS,

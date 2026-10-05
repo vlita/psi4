@@ -295,7 +295,7 @@ void VBase::set_Cocc(std::vector<SharedMatrix> Coccs) {
         for (SharedMatrix Cocc : Coccs) {
             noccs.push_back(Cocc->colspi()[0]);
             auto CoccT = Cocc->transpose();
-            cudaError_t err = cudaMemcpy(d_Coccs_AO_ + d_Cocc_offset, CoccT->get_pointer(0), Cocc->size() * sizeof(double), cudaMemcpyHostToDevice);
+            cudaError_t err = cuest_common::timed_memcpy(d_Coccs_AO_ + d_Cocc_offset, CoccT->get_pointer(0), Cocc->size() * sizeof(double), cudaMemcpyHostToDevice);
             if (err != cudaSuccess) {
                 throw PSIEXCEPTION("cudaMemcpy failed in VBase::set_Cocc");
             }
@@ -1618,7 +1618,7 @@ void RV::compute_V(std::vector<SharedMatrix> ret) {
         cuest_common::freeWorkspace(temporary_workspace);
         SharedMatrix h_weights = std::make_shared<Matrix>("weights", 1, npoints);
         double *p_weights = h_weights->pointer()[0];
-        err = cudaMemcpy(h_weights->pointer()[0], d_weights, npoints * sizeof(double), cudaMemcpyDeviceToHost);
+        err = cuest_common::timed_memcpy(h_weights->pointer()[0], d_weights, npoints * sizeof(double), cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in RV::compute_V");
         }
@@ -1674,7 +1674,7 @@ void RV::compute_V(std::vector<SharedMatrix> ret) {
 
         // Copy the density and its derivatives to host, then transpose it for easier access.
         SharedMatrix h_rho_matrix = std::make_shared<Matrix>("rho", npoints, ncomponents);
-        err = cudaMemcpy(h_rho_matrix->pointer()[0], d_rho, npoints * ncomponents * sizeof(double), cudaMemcpyDeviceToHost);
+        err = cuest_common::timed_memcpy(h_rho_matrix->pointer()[0], d_rho, npoints * ncomponents * sizeof(double), cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in RV::compute_V");
         }
@@ -1885,7 +1885,7 @@ void RV::compute_V(std::vector<SharedMatrix> ret) {
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMalloc failed in RV::compute_V");
         }
-        err = cudaMemcpy(d_Vxc_grid, p_Vxc_grid, npoints * ncomponents * sizeof(double), cudaMemcpyHostToDevice);
+        err = cuest_common::timed_memcpy(d_Vxc_grid, p_Vxc_grid, npoints * ncomponents * sizeof(double), cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in RV::compute_V");
         }
@@ -1922,7 +1922,7 @@ void RV::compute_V(std::vector<SharedMatrix> ret) {
 
         cudaFree(d_Vxc_grid);
         auto V_AO = std::make_shared<Matrix>("V AO Temp", nbf_, nbf_);
-        err = cudaMemcpy(V_AO->get_pointer(0), d_Vxc, nbf2 * sizeof(double), cudaMemcpyDeviceToHost);
+        err = cuest_common::timed_memcpy(V_AO->get_pointer(0), d_Vxc, nbf2 * sizeof(double), cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
             cudaFree(d_Vxc);
             throw PSIEXCEPTION("cudaMemcpy failed in RV::compute_V");
@@ -1994,7 +1994,7 @@ void RV::compute_V(std::vector<SharedMatrix> ret) {
 
             // Add the VV10 contribution to Vxc
             auto VV10 = std::make_shared<Matrix>("VV10 AO Temp", nbf_, nbf_);
-            err = cudaMemcpy(VV10->get_pointer(0), d_Vxc, nbf2 * sizeof(double), cudaMemcpyDeviceToHost);
+            err = cuest_common::timed_memcpy(VV10->get_pointer(0), d_Vxc, nbf2 * sizeof(double), cudaMemcpyDeviceToHost);
             if (err != cudaSuccess) {
                 cudaFree(d_Vxc);
                 throw PSIEXCEPTION("cudaMemcpy failed in RV::compute_V");
@@ -2805,7 +2805,7 @@ SharedMatrix RV::compute_gradient() {
         cuest_common::freeWorkspace(temporary_workspace);
         SharedMatrix h_weights = std::make_shared<Matrix>("weights", 1, npoints);
         double *p_weights = h_weights->pointer()[0];
-        err = cudaMemcpy(h_weights->pointer()[0], d_weights, npoints * sizeof(double), cudaMemcpyDeviceToHost);
+        err = cuest_common::timed_memcpy(h_weights->pointer()[0], d_weights, npoints * sizeof(double), cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in RV::compute_V");
         }
@@ -2861,7 +2861,7 @@ SharedMatrix RV::compute_gradient() {
 
         // Copy the density and its derivatives to host, then transpose it for easier access.
         SharedMatrix h_rho_matrix = std::make_shared<Matrix>("rho", npoints, ncomponents);
-        err = cudaMemcpy(h_rho_matrix->pointer()[0], d_rho, npoints * ncomponents * sizeof(double), cudaMemcpyDeviceToHost);
+        err = cuest_common::timed_memcpy(h_rho_matrix->pointer()[0], d_rho, npoints * ncomponents * sizeof(double), cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in RV::compute_V");
         }
@@ -3072,7 +3072,7 @@ SharedMatrix RV::compute_gradient() {
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMalloc failed in RV::compute_V");
         }
-        err = cudaMemcpy(d_Vxc_grid, p_Vxc_grid, npoints * ncomponents * sizeof(double), cudaMemcpyHostToDevice);
+        err = cuest_common::timed_memcpy(d_Vxc_grid, p_Vxc_grid, npoints * ncomponents * sizeof(double), cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in RV::compute_V");
         }
@@ -3118,13 +3118,13 @@ SharedMatrix RV::compute_gradient() {
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMalloc failed in RV::compute_V");
         }
-        err = cudaMemcpy(d_exc, p_full_f, npoints * sizeof(double), cudaMemcpyHostToDevice);
+        err = cuest_common::timed_memcpy(d_exc, p_full_f, npoints * sizeof(double), cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in RV::compute_V");
         }
 
         // Copy the atom gradient to the result matrix - we still need to work out the chain rule terms involving the grid below
-        err = cudaMemcpy(grad->get_pointer(0), d_Vxc_grad_atom, 3 * natom * sizeof(double), cudaMemcpyDeviceToHost);
+        err = cuest_common::timed_memcpy(grad->get_pointer(0), d_Vxc_grad_atom, 3 * natom * sizeof(double), cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in RV::compute_V");
         }
@@ -3154,7 +3154,7 @@ SharedMatrix RV::compute_gradient() {
 
         // Combine the atom gradient and the grid gradient
         SharedMatrix grad_atom_from_grid = grad->clone();
-        err = cudaMemcpy(grad_atom_from_grid->get_pointer(0), d_Vxc_grad_atom, 3 * natom * sizeof(double), cudaMemcpyDeviceToHost);
+        err = cuest_common::timed_memcpy(grad_atom_from_grid->get_pointer(0), d_Vxc_grad_atom, 3 * natom * sizeof(double), cudaMemcpyDeviceToHost);
         grad->add(grad_atom_from_grid);
         grad->scale(2.0);
 
@@ -3213,7 +3213,7 @@ SharedMatrix RV::compute_gradient() {
 
             // Add the VV10 contribution to Vxc
             SharedMatrix VV10grad = grad->clone();
-            err = cudaMemcpy(VV10grad->get_pointer(0), d_Vxc_grad_atom, 3 * natom * sizeof(double), cudaMemcpyDeviceToHost);
+            err = cuest_common::timed_memcpy(VV10grad->get_pointer(0), d_Vxc_grad_atom, 3 * natom * sizeof(double), cudaMemcpyDeviceToHost);
             grad->add(VV10grad);
         }
 
@@ -3947,7 +3947,7 @@ void UV::compute_V(std::vector<SharedMatrix> ret) {
         cuest_common::freeWorkspace(temporary_workspace);
         SharedMatrix h_weights = std::make_shared<Matrix>("weights", 1, npoints);
         double *p_weights = h_weights->pointer()[0];
-        err = cudaMemcpy(h_weights->pointer()[0], d_weights, npoints * sizeof(double), cudaMemcpyDeviceToHost);
+        err = cuest_common::timed_memcpy(h_weights->pointer()[0], d_weights, npoints * sizeof(double), cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in UV::compute_V");
         }
@@ -4041,11 +4041,11 @@ void UV::compute_V(std::vector<SharedMatrix> ret) {
         // Copy the density and its derivatives to host, then transpose it for easier access.
         SharedMatrix h_rho_a_matrix = std::make_shared<Matrix>("rho_a", npoints, ncomponents);
         SharedMatrix h_rho_b_matrix = std::make_shared<Matrix>("rho_b", npoints, ncomponents);
-        err = cudaMemcpy(h_rho_a_matrix->pointer()[0], d_rho_a, npoints * ncomponents * sizeof(double), cudaMemcpyDeviceToHost);
+        err = cuest_common::timed_memcpy(h_rho_a_matrix->pointer()[0], d_rho_a, npoints * ncomponents * sizeof(double), cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in UV::compute_V");
         }
-        err = cudaMemcpy(h_rho_b_matrix->pointer()[0], d_rho_b, npoints * ncomponents * sizeof(double), cudaMemcpyDeviceToHost);
+        err = cuest_common::timed_memcpy(h_rho_b_matrix->pointer()[0], d_rho_b, npoints * ncomponents * sizeof(double), cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in UV::compute_V");
         }
@@ -4319,7 +4319,7 @@ void UV::compute_V(std::vector<SharedMatrix> ret) {
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMalloc failed in UV::compute_V");
         }
-        err = cudaMemcpy(d_Vxc_grid_a, p_Vxc_grid_a, npoints * ncomponents * sizeof(double), cudaMemcpyHostToDevice);
+        err = cuest_common::timed_memcpy(d_Vxc_grid_a, p_Vxc_grid_a, npoints * ncomponents * sizeof(double), cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in UV::compute_V");
         }
@@ -4327,7 +4327,7 @@ void UV::compute_V(std::vector<SharedMatrix> ret) {
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMalloc failed in UV::compute_V");
         }
-        err = cudaMemcpy(d_Vxc_grid_b, p_Vxc_grid_b, npoints * ncomponents * sizeof(double), cudaMemcpyHostToDevice);
+        err = cuest_common::timed_memcpy(d_Vxc_grid_b, p_Vxc_grid_b, npoints * ncomponents * sizeof(double), cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in UV::compute_V");
         }
@@ -4389,12 +4389,12 @@ void UV::compute_V(std::vector<SharedMatrix> ret) {
         cudaFree(d_Vxc_grid_b);
         auto Va_AO = std::make_shared<Matrix>("Va AO Temp", nbf_, nbf_);
         auto Vb_AO = std::make_shared<Matrix>("Vb AO Temp", nbf_, nbf_);
-        err = cudaMemcpy(Va_AO->get_pointer(0), d_Vxc_a, nbf2 * sizeof(double), cudaMemcpyDeviceToHost);
+        err = cuest_common::timed_memcpy(Va_AO->get_pointer(0), d_Vxc_a, nbf2 * sizeof(double), cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
             cudaFree(d_Vxc_a);
             throw PSIEXCEPTION("cudaMemcpy failed in UV::compute_V");
         }
-        err = cudaMemcpy(Vb_AO->get_pointer(0), d_Vxc_b, nbf2 * sizeof(double), cudaMemcpyDeviceToHost);
+        err = cuest_common::timed_memcpy(Vb_AO->get_pointer(0), d_Vxc_b, nbf2 * sizeof(double), cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
             cudaFree(d_Vxc_b);
             throw PSIEXCEPTION("cudaMemcpy failed in UV::compute_V");
@@ -4472,7 +4472,7 @@ void UV::compute_V(std::vector<SharedMatrix> ret) {
 
             // Add the VV10 contribution to Vxc
             auto VV10 = std::make_shared<Matrix>("VV10 AO Temp", nbf_, nbf_);
-            err = cudaMemcpy(VV10->get_pointer(0), d_Vxc_a, nbf2 * sizeof(double), cudaMemcpyDeviceToHost);
+            err = cuest_common::timed_memcpy(VV10->get_pointer(0), d_Vxc_a, nbf2 * sizeof(double), cudaMemcpyDeviceToHost);
             if (err != cudaSuccess) {
                 throw PSIEXCEPTION("cudaMemcpy failed in UV::compute_V");
             }
@@ -5734,7 +5734,7 @@ SharedMatrix UV::compute_gradient() {
         cuest_common::freeWorkspace(temporary_workspace);
         SharedMatrix h_weights = std::make_shared<Matrix>("weights", 1, npoints);
         double *p_weights = h_weights->pointer()[0];
-        err = cudaMemcpy(h_weights->pointer()[0], d_weights, npoints * sizeof(double), cudaMemcpyDeviceToHost);
+        err = cuest_common::timed_memcpy(h_weights->pointer()[0], d_weights, npoints * sizeof(double), cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in UV::compute_gradient");
         }
@@ -5824,11 +5824,11 @@ SharedMatrix UV::compute_gradient() {
         // Copy the density and its derivatives to host, then transpose it for easier access.
         SharedMatrix h_rho_a_matrix = std::make_shared<Matrix>("rho_a", npoints, ncomponents);
         SharedMatrix h_rho_b_matrix = std::make_shared<Matrix>("rho_b", npoints, ncomponents);
-        err = cudaMemcpy(h_rho_a_matrix->pointer()[0], d_rho_a, npoints * ncomponents * sizeof(double), cudaMemcpyDeviceToHost);
+        err = cuest_common::timed_memcpy(h_rho_a_matrix->pointer()[0], d_rho_a, npoints * ncomponents * sizeof(double), cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in UV::compute_gradient");
         }
-        err = cudaMemcpy(h_rho_b_matrix->pointer()[0], d_rho_b, npoints * ncomponents * sizeof(double), cudaMemcpyDeviceToHost);
+        err = cuest_common::timed_memcpy(h_rho_b_matrix->pointer()[0], d_rho_b, npoints * ncomponents * sizeof(double), cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in UV::compute_gradient");
         }
@@ -6102,7 +6102,7 @@ SharedMatrix UV::compute_gradient() {
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMalloc failed in UV::compute_gradient");
         }
-        err = cudaMemcpy(d_Vxc_grid_a, p_Vxc_grid_a, npoints * ncomponents * sizeof(double), cudaMemcpyHostToDevice);
+        err = cuest_common::timed_memcpy(d_Vxc_grid_a, p_Vxc_grid_a, npoints * ncomponents * sizeof(double), cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in UV::compute_gradient");
         }
@@ -6110,7 +6110,7 @@ SharedMatrix UV::compute_gradient() {
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMalloc failed in UV::compute_gradient");
         }
-        err = cudaMemcpy(d_Vxc_grid_b, p_Vxc_grid_b, npoints * ncomponents * sizeof(double), cudaMemcpyHostToDevice);
+        err = cuest_common::timed_memcpy(d_Vxc_grid_b, p_Vxc_grid_b, npoints * ncomponents * sizeof(double), cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in UV::compute_gradient");
         }
@@ -6185,17 +6185,17 @@ SharedMatrix UV::compute_gradient() {
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMalloc failed in UV::compute_gradient");
         }
-        err = cudaMemcpy(d_exc, p_full_f, npoints * sizeof(double), cudaMemcpyHostToDevice);
+        err = cuest_common::timed_memcpy(d_exc, p_full_f, npoints * sizeof(double), cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in UV::compute_gradient");
         }
-        err = cudaMemcpy(grad->get_pointer(0), d_Vxc_grad_atom_a, 3 * natom * sizeof(double), cudaMemcpyDeviceToHost);
+        err = cuest_common::timed_memcpy(grad->get_pointer(0), d_Vxc_grad_atom_a, 3 * natom * sizeof(double), cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in UV::compute_gradient");
         }
 
         SharedMatrix grad_tmp = grad->clone();
-        err = cudaMemcpy(grad_tmp->get_pointer(0), d_Vxc_grad_atom_b, 3 * natom * sizeof(double), cudaMemcpyDeviceToHost);
+        err = cuest_common::timed_memcpy(grad_tmp->get_pointer(0), d_Vxc_grad_atom_b, 3 * natom * sizeof(double), cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
             throw PSIEXCEPTION("cudaMemcpy failed in UV::compute_gradient");
         }
@@ -6237,7 +6237,7 @@ SharedMatrix UV::compute_gradient() {
         cuest_common::freeWorkspace(temporary_workspace);
         CHECK_CUEST(cuestParametersDestroy(CUEST_XCGRIDDERIVATIVECOMPUTE_PARAMETERS, grid_derivative_compute_parameters));
 
-        cudaMemcpy(grad_tmp->get_pointer(0), d_Vxc_grad_atom_a, 3 * natom * sizeof(double), cudaMemcpyDeviceToHost);
+        cuest_common::timed_memcpy(grad_tmp->get_pointer(0), d_Vxc_grad_atom_a, 3 * natom * sizeof(double), cudaMemcpyDeviceToHost);
         grad->add(grad_tmp);
 
         if (functional_->needs_vv10()) {
@@ -6299,7 +6299,7 @@ SharedMatrix UV::compute_gradient() {
             CHECK_CUEST(cuestParametersDestroy(CUEST_NONLOCALXCDERIVATIVEUKSCOMPUTE_PARAMETERS, vv10_derivative_compute_parameters));
 
             // Add the VV10 contribution to the Vxc gradient
-            err = cudaMemcpy(grad_tmp->get_pointer(0), d_Vxc_grad_atom_a, 3 * natom * sizeof(double), cudaMemcpyDeviceToHost);
+            err = cuest_common::timed_memcpy(grad_tmp->get_pointer(0), d_Vxc_grad_atom_a, 3 * natom * sizeof(double), cudaMemcpyDeviceToHost);
             if (err != cudaSuccess) {
                 throw PSIEXCEPTION("cudaMemcpy failed in UV::compute_gradient");
             }

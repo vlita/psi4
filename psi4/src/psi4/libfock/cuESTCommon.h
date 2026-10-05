@@ -39,6 +39,7 @@
 
 #include "psi4/libmints/basisset.h"
 #include "psi4/libmints/molecule.h"
+#include "psi4/libfock/cuESTTransferTimer.h"
 #include "psi4/libpsi4util/exception.h"
 
 #include <cstdlib>

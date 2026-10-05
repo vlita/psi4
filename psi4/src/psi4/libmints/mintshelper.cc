@@ -4540,7 +4540,7 @@ void MintsHelper::form_S_cuest(SharedMatrix hostS) {
         CUEST_OVERLAPCOMPUTE_PARAMETERS, 
         overlap_compute_parameters));
 
-    cudaMemcpy(hostS->pointer()[0], d_overlap_matrix, basisset_->nbf() * basisset_->nbf() * sizeof(double), cudaMemcpyDeviceToHost);
+    cuest_common::timed_memcpy(hostS->pointer()[0], d_overlap_matrix, basisset_->nbf() * basisset_->nbf() * sizeof(double), cudaMemcpyDeviceToHost);
     cudaFree(d_overlap_matrix);
 }
 
@@ -4576,7 +4576,7 @@ void MintsHelper::form_T_cuest(SharedMatrix hostT) {
         CUEST_KINETICCOMPUTE_PARAMETERS, 
         kinetic_compute_parameters));
 
-    cudaMemcpy(hostT->pointer()[0], d_kinetic_matrix, basisset_->nbf() * basisset_->nbf() * sizeof(double), cudaMemcpyDeviceToHost);
+    cuest_common::timed_memcpy(hostT->pointer()[0], d_kinetic_matrix, basisset_->nbf() * basisset_->nbf() * sizeof(double), cudaMemcpyDeviceToHost);
     cudaFree(d_kinetic_matrix);
 }
 
@@ -4594,8 +4594,8 @@ void MintsHelper::form_V_cuest(SharedMatrix hostV) {
     cudaMalloc((void**) &d_xyz_matrix, natom * 3 * sizeof(double));
     cudaMalloc((void**) &d_q_matrix, natom * sizeof(double));
 
-    cudaMemcpy(d_xyz_matrix, mol->geometry().pointer()[0], natom * 3 * sizeof(double), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_q_matrix,   Zs.data(), natom * sizeof(double), cudaMemcpyHostToDevice);
+    cuest_common::timed_memcpy(d_xyz_matrix, mol->geometry().pointer()[0], natom * 3 * sizeof(double), cudaMemcpyHostToDevice);
+    cuest_common::timed_memcpy(d_q_matrix,   Zs.data(), natom * sizeof(double), cudaMemcpyHostToDevice);
 
     double* d_potential_matrix = NULL;
     cudaMalloc((void**) &d_potential_matrix, basisset_->nbf() * basisset_->nbf() * sizeof(double));
@@ -4634,7 +4634,7 @@ void MintsHelper::form_V_cuest(SharedMatrix hostV) {
         CUEST_POTENTIALCOMPUTE_PARAMETERS, 
         potential_compute_parameters));
 
-    cudaMemcpy(hostV->pointer()[0], d_potential_matrix, basisset_->nbf() * basisset_->nbf() * sizeof(double), cudaMemcpyDeviceToHost);
+    cuest_common::timed_memcpy(hostV->pointer()[0], d_potential_matrix, basisset_->nbf() * basisset_->nbf() * sizeof(double), cudaMemcpyDeviceToHost);
     cudaFree(d_potential_matrix);
     cudaFree(d_xyz_matrix);
     cudaFree(d_q_matrix);

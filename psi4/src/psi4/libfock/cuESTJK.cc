@@ -326,7 +326,7 @@ void cuESTJK::compute_JK() {
     for (size_t N = 0; N < D_ao_.size(); N++) {
         if (do_J_) {
             auto tc0 = clock::now();
-            cudaMemcpy(d_D, D_ao_[N]->get_pointer(), nbf2_bytes, cudaMemcpyHostToDevice);
+            cuest_common::timed_memcpy(d_D, D_ao_[N]->get_pointer(), nbf2_bytes, cudaMemcpyHostToDevice);
             auto tc1 = clock::now();
             CHECK_CUEST(cuestDFCoulombCompute(
                 cuest_handle,
@@ -337,7 +337,7 @@ void cuESTJK::compute_JK() {
                 d_J));
             cudaDeviceSynchronize();
             auto tc2 = clock::now();
-            cudaMemcpy(J_ao_[N]->get_pointer(), d_J, nbf2_bytes, cudaMemcpyDeviceToHost);
+            cuest_common::timed_memcpy(J_ao_[N]->get_pointer(), d_J, nbf2_bytes, cudaMemcpyDeviceToHost);
             auto tc3 = clock::now();
             ms_memcpy_h2d += std::chrono::duration<double, std::milli>(tc1 - tc0).count();
             ms_J_compute += std::chrono::duration<double, std::milli>(tc2 - tc1).count();
@@ -364,7 +364,7 @@ void cuESTJK::compute_JK() {
                 cudaMalloc(reinterpret_cast<void**>(&d_C), c_bytes);
  
                 auto tk0 = clock::now();
-                cudaMemcpy(d_C, C_row_major.data(), c_bytes, cudaMemcpyHostToDevice);
+                cuest_common::timed_memcpy(d_C, C_row_major.data(), c_bytes, cudaMemcpyHostToDevice);
                 auto tk1 = clock::now();
  
                 CHECK_CUEST(cuestDFSymmetricExchangeCompute(
@@ -379,7 +379,7 @@ void cuESTJK::compute_JK() {
                 cudaDeviceSynchronize();
                 auto tk2 = clock::now();
  
-                cudaMemcpy(K_ao_[N]->get_pointer(), d_K, nbf2_bytes, cudaMemcpyDeviceToHost);
+                cuest_common::timed_memcpy(K_ao_[N]->get_pointer(), d_K, nbf2_bytes, cudaMemcpyDeviceToHost);
                 auto tk3 = clock::now();
  
                 ms_memcpy_h2d += std::chrono::duration<double, std::milli>(tk1 - tk0).count();

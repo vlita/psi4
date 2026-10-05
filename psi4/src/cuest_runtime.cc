@@ -59,6 +59,7 @@
 #include "psi4/libfock/cuESTCommon.h"
 #include "psi4/libpsi4util/PsiOutStream.h"
 #include "psi4/libpsi4util/exception.h"
+#include "psi4/libpsi4util/process.h"
 
 #include "cuest_runtime.h"
 
@@ -334,8 +335,13 @@ namespace psi {
 
 namespace cuest_common {
 
+// Declared in libfock/cuESTTransferTimer.h.
+bool time_transfers = true;
+
 // Declared in libfock/cuESTCommon.h and called from every cuEST entry point.
 void ensure_cuest_initialized() {
+    // Refreshed here rather than read per copy, so the untimed path stays free of option lookups.
+    time_transfers = Process::environment.options.get_bool("CUEST_TIME_TRANSFERS");
     if (cuest_handle == 0) {
         cuest_init();
     }

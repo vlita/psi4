@@ -820,7 +820,7 @@ void HF::form_Shalf() {
                 if (status != cudaSuccess) {
                     throw PSIEXCEPTION("cudaMalloc failed in form Shalf");
                 }
-                status = cudaMemcpy(ptr, X_->get_pointer(h), dim * sizeof(double), cudaMemcpyHostToDevice);
+                status = cuest_common::timed_memcpy(ptr, X_->get_pointer(h), dim * sizeof(double), cudaMemcpyHostToDevice);
                 if (status != cudaSuccess) {
                     throw PSIEXCEPTION("cudaMemcpy failed in form Shalf");
                 }
@@ -1435,7 +1435,7 @@ void HF::diagonalize_F(const SharedMatrix& Fm, SharedMatrix& Cm, std::shared_ptr
 
             double* d_X = d_X_[h];
 
-            err = cudaMemcpy(d_F, Fm->get_pointer(h), nso * nso * sizeof(double), cudaMemcpyHostToDevice);
+            err = cuest_common::timed_memcpy(d_F, Fm->get_pointer(h), nso * nso * sizeof(double), cudaMemcpyHostToDevice);
             if (err != cudaSuccess) {
                 throw PSIEXCEPTION("cudaMemcpy failed in diagonalize_F");
             }
@@ -1483,7 +1483,7 @@ void HF::diagonalize_F(const SharedMatrix& Fm, SharedMatrix& Cm, std::shared_ptr
                 throw PSIEXCEPTION("cublasDgemm failed in diagonalize_F 2" + std::to_string(status));
             }
 
-            err = cudaMemcpy(
+            err = cuest_common::timed_memcpy(
                 cu_diag_F_temp->get_pointer(h),
                 d_F,
                 nmo * nmo * sizeof(double),
@@ -1507,7 +1507,7 @@ void HF::diagonalize_F(const SharedMatrix& Fm, SharedMatrix& Cm, std::shared_ptr
 
             double* d_X = d_X_[h];
 
-            err = cudaMemcpy(d_tmp, cu_diag_C_temp->get_pointer(h), nmo * nmo * sizeof(double), cudaMemcpyHostToDevice);
+            err = cuest_common::timed_memcpy(d_tmp, cu_diag_C_temp->get_pointer(h), nmo * nmo * sizeof(double), cudaMemcpyHostToDevice);
             if (err != cudaSuccess) {
                 throw PSIEXCEPTION("cudaMemcpy failed in diagonalize_F");
             }
@@ -1532,7 +1532,7 @@ void HF::diagonalize_F(const SharedMatrix& Fm, SharedMatrix& Cm, std::shared_ptr
             if (status != CUBLAS_STATUS_SUCCESS) {
                 throw PSIEXCEPTION("cublasDgemm failed in diagonalize_F 3" + std::to_string(status));
             }
-            err = cudaMemcpy(Cm->get_pointer(h), d_F, nso * nmo * sizeof(double), cudaMemcpyDeviceToHost);
+            err = cuest_common::timed_memcpy(Cm->get_pointer(h), d_F, nso * nmo * sizeof(double), cudaMemcpyDeviceToHost);
             if (err != cudaSuccess) {
                 throw PSIEXCEPTION("cudaMemcpy failed in diagonalize_F");
             }
@@ -1647,10 +1647,10 @@ SharedMatrix HF::form_FDSmSDF(SharedMatrix Fso, SharedMatrix Dso) {
             err = cudaMalloc((void**)&d_tmp, S_->size() * sizeof(double)); if (err) throw PSIEXCEPTION("cudaMalloc d_tmp failed");
 
             // Copy inputs as-is (row-major in Psi4, interpreted as column-major by cuBLAS)
-            err = cudaMemcpy(d_F, Fso->get_pointer(0), Fso->size() * sizeof(double), cudaMemcpyHostToDevice); if (err) throw PSIEXCEPTION("cudaMemcpy Fso failed");
-            err = cudaMemcpy(d_D, Dso->get_pointer(0), Dso->size() * sizeof(double), cudaMemcpyHostToDevice); if (err) throw PSIEXCEPTION("cudaMemcpy Dso failed");
-            err = cudaMemcpy(d_S, S_->get_pointer(0), S_->size() * sizeof(double), cudaMemcpyHostToDevice); if (err) throw PSIEXCEPTION("cudaMemcpy S_ failed");
-            err = cudaMemcpy(d_X, X_->get_pointer(0), X_->size() * sizeof(double), cudaMemcpyHostToDevice); if (err) throw PSIEXCEPTION("cudaMemcpy X_ failed");
+            err = cuest_common::timed_memcpy(d_F, Fso->get_pointer(0), Fso->size() * sizeof(double), cudaMemcpyHostToDevice); if (err) throw PSIEXCEPTION("cudaMemcpy Fso failed");
+            err = cuest_common::timed_memcpy(d_D, Dso->get_pointer(0), Dso->size() * sizeof(double), cudaMemcpyHostToDevice); if (err) throw PSIEXCEPTION("cudaMemcpy Dso failed");
+            err = cuest_common::timed_memcpy(d_S, S_->get_pointer(0), S_->size() * sizeof(double), cudaMemcpyHostToDevice); if (err) throw PSIEXCEPTION("cudaMemcpy S_ failed");
+            err = cuest_common::timed_memcpy(d_X, X_->get_pointer(0), X_->size() * sizeof(double), cudaMemcpyHostToDevice); if (err) throw PSIEXCEPTION("cudaMemcpy X_ failed");
 
             stat = cublasDgemm(cublas_handle,
                             CUBLAS_OP_N, CUBLAS_OP_N,
@@ -1706,7 +1706,7 @@ SharedMatrix HF::form_FDSmSDF(SharedMatrix Fso, SharedMatrix Dso) {
                 throw PSIEXCEPTION("cublasDgemm X^T*(A*X) failed in form_FDSmSDF");
 
             auto FDSmSDF_host = std::make_shared<Matrix>(nirrep_, nmopi_, nmopi_);
-            err = cudaMemcpy(FDSmSDF_host->get_pointer(0), d_tmp, Xn * Xn * sizeof(double), cudaMemcpyDeviceToHost);
+            err = cuest_common::timed_memcpy(FDSmSDF_host->get_pointer(0), d_tmp, Xn * Xn * sizeof(double), cudaMemcpyDeviceToHost);
             if (err) throw PSIEXCEPTION("cudaMemcpy result failed in form_FDSmSDF");
 
             cudaFree(d_F);

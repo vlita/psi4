@@ -180,6 +180,10 @@ int read_options(const std::string &name, Options &options, bool suppress_printi
     options.add_int("CUEST_DFK_SLICES", 5);
     /*- Tune # of Ozaki Moduli in emulated DF K computations (requires CUDA and cuEST libraries) -*/
     options.add_int("CUEST_DFK_MODULI", 8);
+    /*- Time every cuEST host<->device copy under the ``cuEST: H2D`` / ``cuEST: D2H`` entries in timer.dat.
+    Each timed copy is bracketed by device synchronizations, which can perturb total runtime; set false
+    to measure the untimed baseline (requires CUDA and cuEST libraries). -*/
+    options.add_bool("CUEST_TIME_TRANSFERS", true);
 
     // Note that case-insensitive options are only functional as
     //   globals, not as module-level, and should be defined sparingly
