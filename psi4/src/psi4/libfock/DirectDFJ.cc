@@ -278,7 +278,7 @@ void DirectDFJ::build_G_component(std::vector<std::shared_ptr<Matrix>>& D, std::
         auto bra = eri_computers[rank]->shell_pairs()[MN];
         size_t M = bra.first;
         size_t N = bra.second;
-        if(H_shell_maxp[P] * H_shell_maxp[P] * J_metric_shell_diag[P] * eri_computers[rank]->shell_pair_value(M,N) < thresh2) {
+        if(H_shell_maxp[P] * H_shell_maxp[P] * J_metric_shell_diag[P] * eri_computers[rank]->shell_pair_value(M,N) < 0.0) {
             continue;
         }
         computed_triplets2++;
