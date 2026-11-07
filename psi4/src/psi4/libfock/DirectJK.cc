@@ -113,7 +113,8 @@ void DirectJK::print_header() const {
         outfile->Printf("  ==> DirectJK: Integral-Direct J/K Matrices <==\n\n");
 
         outfile->Printf("    J tasked:          %11s\n", (do_J_ ? "Yes" : "No"));
-        outfile->Printf("    K tasked:          %11s\n", (do_K_ ? "Yes" : "No"));
+        outfile->Printf("    K tasked:          %11s\n", (do_K_ ? "COSX" : "No"));
+        if (do_K_) outfile->Printf("    Non-symmetric K:   %11s\n", "Direct");
         outfile->Printf("    wK tasked:         %11s\n", (do_wK_ ? "Yes" : "No"));
         if (do_wK_) outfile->Printf("    Omega:             %11.3E\n", omega_);
         outfile->Printf("    Integrals threads: %11d\n", df_ints_num_threads_);
@@ -129,6 +130,10 @@ void DirectJK::preiterations() {
     J_delta_.clear();
     K_delta_.clear();
     wK_delta_.clear();
+
+    // COSX builds its grids (and overlap-fitting metrics) once per SCF cycle
+    cosx_algo_ = std::make_shared<COSK>(primary_, options_);
+    cosx_algo_->set_grid(cosx_grid_);
     
 #ifdef USING_BrianQC
     if (brianEnable) {
@@ -402,19 +407,37 @@ void DirectJK::compute_JK() {
         build_JK_matrices(ints, D_ref_, temp, wK_out);
     }
 
-    if (do_J_ || do_K_) {
+    // COSX only supports left-right symmetric densities; fall back to direct K otherwise
+    bool use_cosx = do_K_ && lr_symmetric_;
+    bool direct_K = do_K_ && !use_cosx;
+    if (do_J_ || direct_K) {
         std::vector<std::shared_ptr<TwoBodyAOInt>> ints;
         ints.push_back(std::shared_ptr<TwoBodyAOInt>(factory->eri()));
         if (density_screening_) ints[0]->update_density(D_ref_);
         for (int thread = 1; thread < df_ints_num_threads_; thread++) {
             ints.push_back(std::shared_ptr<TwoBodyAOInt>(ints[0]->clone()));
         }
-        if (do_J_ && do_K_) {
+        if (do_J_ && direct_K) {
             build_JK_matrices(ints, D_ref_, J_out, K_out);
         } else if (do_J_) {
             build_JK_matrices(ints, D_ref_, J_out, temp);
         } else {
             build_JK_matrices(ints, D_ref_, temp, K_out);
+        }
+    }
+
+    if (use_cosx) {
+        // COSK accumulates into K_out, which is already zeroed (zero() on full builds,
+        // incfock_setup() on incremental ones). It computes its own grid integrals,
+        // so the ERI engine list is unused.
+        std::vector<std::shared_ptr<TwoBodyAOInt>> no_ints;
+        cosx_algo_->set_grid(cosx_grid_);
+        timer_on("DirectJK: COSX " + cosx_grid_ + " Grid");
+        cosx_algo_->build_G_component(D_ref_, K_out, no_ints);
+        timer_off("DirectJK: COSX " + cosx_grid_ + " Grid");
+        num_computed_shells_ = (do_J_ ? num_computed_shells_ : 0) + cosx_algo_->num_computed_shells();
+        if (get_bench()) {
+            computed_shells_per_iter_["COSX Shells"].push_back(cosx_algo_->num_computed_shells());
         }
     }
 
@@ -438,7 +461,16 @@ void DirectJK::compute_JK() {
 
     if (initial_iteration_) initial_iteration_ = false;
 }
-void DirectJK::postiterations() {}
+void DirectJK::postiterations() { cosx_algo_.reset(); }
+
+void DirectJK::set_COSX_grid(std::string current_grid) {
+    if (current_grid != "Initial" && current_grid != "Final") {
+        throw PSIEXCEPTION("DirectJK::set_COSX_grid(): grid must be \"Initial\" or \"Final\", got \"" +
+                           current_grid + "\"");
+    }
+    cosx_grid_ = current_grid;
+    if (cosx_algo_) cosx_algo_->set_grid(cosx_grid_);
+}
 
 void DirectJK::build_JK_matrices(std::vector<std::shared_ptr<TwoBodyAOInt>>& ints, const std::vector<SharedMatrix>& D,
                         std::vector<SharedMatrix>& J, std::vector<SharedMatrix>& K) {

@@ -725,6 +725,10 @@ class PSI_API PKJK : public JK {
  */
 class PSI_API DirectJK : public JK {
    protected:
+    /// COSX handles symmetric exchange builds; direct K handles non-symmetric ones.
+    std::shared_ptr<COSK> cosx_algo_;
+    /// COSX grid ("Initial" or "Final") requested by the SCF driver
+    std::string cosx_grid_ = "Final";
     /// Number of threads for DF integrals TODO: DF_INTS_NUM_THREADS
     int df_ints_num_threads_;
     /// ERI Sieve
@@ -821,6 +825,13 @@ class PSI_API DirectJK : public JK {
 
     // => Accessors <= //
     bool do_incfock_iter() { return do_incfock_iter_; }
+
+    /// Clear the previous density so the next build is a full (non-incremental) one
+    void clear_D_prev() { D_prev_.clear(); }
+
+    /// Set/get the COSX grid used for this SCF iteration ("Initial" or "Final")
+    void set_COSX_grid(std::string current_grid);
+    std::string get_COSX_grid() { return cosx_grid_; }
 
     /**
     * Print header information regarding JK

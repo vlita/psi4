@@ -276,7 +276,9 @@ def scf_iterate(self, e_conv=None, d_conv=None):
     soscf_enabled = _validate_soscf()
     frac_enabled = _validate_frac()
     efp_enabled = hasattr(self.molecule(), 'EFP')
-    cosx_enabled = "COSX" in core.get_option('SCF', 'SCF_TYPE')
+    # on this branch, SCF_TYPE DIRECT builds symmetric K with COSX, so it needs grid switching too
+    cosx_enabled = ("COSX" in core.get_option('SCF', 'SCF_TYPE')) or (core.get_option('SCF', 'SCF_TYPE') == "DIRECT")
+    cosx_enabled = cosx_enabled and hasattr(self.jk(), 'set_COSX_grid')
     directjk_enabled = "DIRECT" in core.get_option('SCF', 'SCF_TYPE')
     incfock_enabled = core.get_option('SCF', 'INCFOCK')
     var_tol_enabled = core.get_option('SCF', 'INCFOCK_VAR_INTS_TOL')
