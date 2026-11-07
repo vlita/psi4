@@ -24,10 +24,13 @@ nocc =
 nvir = 
 nao = 
 
+double* Bia_ = nullptr;
+cudaMalloc((void**) &Bia_, naux * nocc * nvir * sizeof(double);
+
 cuest_common::ensure_cuest_initialized();
 variable_buffer_size_bytes_ = 2000000000
 
-cuest_primary_basis_ = primary->cuest_basis();
+cuest_primary_basis_ = primary->cuest_basis();MN
 cuest_auxiliary_basis_ = auxiliary->cuest_basis();
 
 std::shared_ptr<cuESTJK> cuest_jk = std::dynamic_pointer_cast<cuESTJK>(jk_);
@@ -39,29 +42,7 @@ cuestWorkspaceDescriptor_t* temporaryWorkspaceDescriptor = (cuestWorkspaceDescri
 // DESTRUCTOR
 //free temporary and persistent workspaces
 
-void cuESTDFMP2::Bia(
-) {
-    // input: cuest scf metadata, device buffer for Bia
-    // output: Bia
-
-    // needs the following either explicitly or stored on the cuest_df_plan object:
-    // 1. cuest_primary basis
-    // 2. cuest_auxillary basis
-    // 3. cuest_ao pair list
-    // 4. df_fitting_eigenvalue_cutoff
-
-    // needs the following explicitly:
-    // 1. cuest_handle
-    // 2. cuest_df_plan
-    // 3. MO integrals compute parameters (no configurable parameters at this time)
-    // 4. variableBufferSize
-    // 5. temporary workspace
-    // 6. numCoefficientMatrices (1, determined by the fact that we are using an rhf reference I think)
-    // 7. numLeftOrbitals (number of occupied orbitals, nocc) 
-    // 8. numRightOrbitals (number of virtual orbitals, nvirt)
-    // 9. leftCoefficientMatrices [nocc, nao] 
-    // 10. rightCoefficientMatrices [nvir, nao] both of these quantities we can pull off of Ca.
-    // 11. outTensors (Bia buffer)    
+void cuESTDFMP2::form_Bia() {
 
     // get MO coefficient matricies from wfn
     auto Cocc = wfn->Ca_subset("AO", "ACTIVE_OCC");
@@ -83,7 +64,8 @@ void cuESTDFMP2::Bia(
     cudaMemcpy(d_Cleft, Cleft, sizeof(double) * nvir * nao, cudaMemcpyHostToDevice);
 
     // code below is adapeted from the CUDALibrarySamples df_mo_integrals example
-        
+
+    // presently there are no configurable parameters for this computation
     cuestDFMOIntegralsComputeParameters_t params;
     checkCuestErrors(cuestParametersCreate(
         CUEST_DFMOINTEGRALSCOMPUTE_PARAMETERS,
@@ -94,7 +76,7 @@ void cuESTDFMP2::Bia(
     variableBufferSize->deviceBufferSizeInBytes = variable_buffer_size_bytes_;
 
     // workspace query to determine temporary space needed to form Bia
-    checkCuestErrors(cuestDFMOIntegralsComputeWorkspaceQuery(
+    CHECK_CUEST(cuestDFMOIntegralsComputeWorkspaceQuery(
         cuest_handle,
         cuest_df_plan_,
         params,
@@ -105,12 +87,12 @@ void cuESTDFMP2::Bia(
         nvir,
         d_Cleft,
         d_Cright,
-        Bia));
+        Bia_));
 
     cuestWorkspace_t* temporaryDFMOWorkspace = allocateWorkspace(temporaryWorkspaceDescriptor);
 
     // compute DF MO integrals Bia = (A|ia)
-    checkCuestErrors(cuestDFMOIntegralsCompute(
+    CHECK_CUEST(cuestDFMOIntegralsCompute(
         cuest_handle,
         cuest_df_plan_,
         params,
@@ -121,25 +103,27 @@ void cuESTDFMP2::Bia(
         nvir,
         d_Cleft,
         d_Cright,
-        Bia));
+        Bia_));
 
+    // free buffers
     free(variableBufferSize);
     cuest_common::freeWorkspace(temporaryDFMOWorkspace);
 
-    checkCuestErrors(cuestParametersDestroy(
+    CHECK_CUEST(cuestParametersDestroy(
         CUEST_DFMOINTEGRALSCOMPUTE_PARAMETERS,
         params));
 
-    // free buffers
     cudaFree((void*) d_Cleft);
     cudaFree((void*) d_Cright);
-
 }
 
 
 void cuESTDFMP2::compute_energy () {
-    // double* d_Bia = nullptr;
-    // cudaMalloc((void**) &d_Bia, naux * nocc * nvir * sizeof(double);
+
+    // do we have enough room to pack (ia|jb) = (A|ia)(A|jb) into a few large DGEMMs?
+    size_t free, total;
+    cudaMemGetInfo(size_t *free, size_t *total);
+    
 
 }
 
