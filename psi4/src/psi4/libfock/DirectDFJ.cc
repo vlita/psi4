@@ -95,7 +95,6 @@ void DirectDFJ::build_G_component(std::vector<std::shared_ptr<Matrix>>& D, std::
     // => Sizing <= //
     int njk = D.size();
     int nbf = primary_->nbf();
-    int nshell = primary_->nshell();
     int nbf_aux = auxiliary_->nbf();
     int nshell_aux = auxiliary_->nshell();
 
@@ -136,27 +135,6 @@ void DirectDFJ::build_G_component(std::vector<std::shared_ptr<Matrix>>& D, std::
         }
     }
 
-    // shell maxima of D for screening
-    Matrix Dshell(nshell, nshell);
-    auto Dshellp = Dshell.pointer();
-
-    for(size_t M = 0; M < nshell; M++) {
-        int nm = primary_->shell(M).nfunction();
-        int mstart = primary_->shell(M).function_index();
-        for(size_t N = 0; N < nshell; N++) {
-            int nn = primary_->shell(N).nfunction();
-            int nstart = primary_->shell(N).function_index();
-            for(size_t jki = 0; jki < njk; jki++) {
-                auto Dp = D[jki]->pointer();
-                for(size_t m = mstart; m < mstart + nm; m++) {
-                    for(size_t n = nstart; n < nstart + nn; n++) {
-                        Dshellp[M][N] = std::max(Dshellp[M][N], std::abs(Dp[m][n]));
-                    }
-                }
-            }
-        }
-    }
-
     timer_off("Setup");
 
     //  => First Contraction <= //
@@ -166,7 +144,7 @@ void DirectDFJ::build_G_component(std::vector<std::shared_ptr<Matrix>>& D, std::
     // G_{p} correlates to gamma_P in Figure 1 of Weigend's paper
 
     timer_on("ERI1");
-#pragma omp parallel for schedule(guided) num_threads(nthreads_) reduction(+ : computed_triplets1)
+#pragma omp parallel for schedule(guided) num_threads(nthreads_)
     for (size_t MNP = 0; MNP < nshelltriplet; MNP++) {
 
         size_t MN = MNP % nshellpair;
@@ -178,12 +156,7 @@ void DirectDFJ::build_G_component(std::vector<std::shared_ptr<Matrix>>& D, std::
         auto bra = eri_computers[rank]->shell_pairs()[MN];
         size_t M = bra.first;
         size_t N = bra.second;
-        // off-diagonal shell pairs contribute (D_mn + D_nm) * (mn|p) below, so bound both blocks
-        double Dbound = (M == N) ? Dshellp[M][N] : Dshellp[M][N] + Dshellp[N][M];
-        if(Dbound * Dbound * J_metric_shell_diag[P] * eri_computers[rank]->shell_pair_value(M,N) < 0.0) {
-            continue;
-        }
-        computed_triplets1++;
+
         int np = auxiliary_->shell(P).nfunction();
         int pstart = auxiliary_->shell(P).function_index();
         int nm = primary_->shell(M).nfunction();
@@ -210,6 +183,8 @@ void DirectDFJ::build_G_component(std::vector<std::shared_ptr<Matrix>>& D, std::
         }
 
     }
+
+    computed_triplets1 = nshelltriplet;
 
     timer_off("ERI1");
 
