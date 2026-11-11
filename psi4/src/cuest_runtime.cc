@@ -290,6 +290,14 @@ void cuest_init() {
         if (cublas_status != CUBLAS_STATUS_SUCCESS) {
             throw PSIEXCEPTION("cublasCreate failed in cuest_init");
         }
+
+        if (options.get_str("CUBLAS_MIXED_PRECISION") == "Enabled") {
+            cublasStatus_t math_status = cublasSetMathMode(cublas_handle, CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH);
+            if (math_status != CUBLAS_STATUS_SUCCESS) {
+                throw PSIEXCEPTION("cublasSetMathMode failed in cuest_init");
+            }
+        }
+        
         cusolverStatus_t cusolver_status = cusolverDnCreate(&cusolver_handle);
         if (cusolver_status != CUSOLVER_STATUS_SUCCESS) {
             throw PSIEXCEPTION("cusolverDnCreate failed in cuest_init");
