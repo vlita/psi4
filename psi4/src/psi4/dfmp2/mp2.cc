@@ -61,8 +61,8 @@
 #include <cublas_v2.h>
 
 #include "mp2_kernels.h"
+#include "psi4/lib3index/cuESTMOInts.h"
 #include "psi4/libfock/cuESTCommon.h"
-#include "psi4/libfock/cuESTJK.h"
 
 extern cudaStream_t stream_handle;
 extern cuestHandle_t cuest_handle;
@@ -199,12 +199,6 @@ void DFMP2::common_init() {
 
 #ifdef USING_cuEST
     cuest_common::ensure_cuest_initialized();
-
-    cuest_primary_basis_ = primary->cuest_basis();
-    cuest_auxiliary_basis_ = auxiliary->cuest_basis();
-    
-    std::shared_ptr<cuESTJK> cuest_jk = std::dynamic_pointer_cast<cuESTJK>(jk_);
-    cuestDFIntPlan_t cuest_df_plan_ = cuest_jk->cuest_df_plan();
 #endif
 }
 double DFMP2::compute_energy() {
@@ -855,11 +849,7 @@ void RDFMP2::print_header() {
     }
 
     outfile->Printf("\t --------------------------------------------------------\n");
-#ifdef USING_cuEST
-    outfile->Printf("\t                 NBF = %5d, NAUX = %5d\n", cuest_primary_basis_->nbf(), cuest_auxiliary_basis_->nbf());
-#else
     outfile->Printf("\t                 NBF = %5d, NAUX = %5d\n", basisset_->nbf(), ribasis_->nbf());
-#endif
     outfile->Printf("\t --------------------------------------------------------\n");
     outfile->Printf("\t %7s %7s %7s %7s %7s %7s %7s\n", "CLASS", "FOCC", "OCC", "AOCC", "AVIR", "VIR", "FVIR");
     outfile->Printf("\t %7s %7d %7d %7d %7d %7d %7d\n", "PAIRS", focc, occ, aocc, avir, vir, fvir);
@@ -872,7 +862,7 @@ void RDFMP2::print_header() {
     cublasMath_t cublas_mode;
     CHECK_CUBLAS(cublasGetMathMode(cublas_handle, &cublas_mode));
 
-    double peak_device_memory_estimate = (static_cast<double>(cuest_auxiliary_basis_->nbf()) * aocc * avir + 3.0 * avir * avir + avir + aocc) * sizeof(double) / (1024.0 * 1024.0 * 1024.0);
+    double peak_device_memory_estimate = (static_cast<double>(ribasis_->nbf()) * aocc * avir + 3.0 * avir * avir + avir + aocc) * sizeof(double) / (1024.0 * 1024.0 * 1024.0);
 
     const char *cuest_str  = (cuest_mode == CUEST_DEFAULT_MATH_MODE)  ? "enabled"  : "disabled";
     const char *cublas_str = (cublas_mode & CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH) ? "enabled"  : "disabled";
@@ -1041,84 +1031,13 @@ void RDFMP2::form_Aia() {
 }
 void RDFMP2::form_Bia() {
 #ifdef USING_cuEST
-    int naocc = Caocc_->colspi()[0];
-    int navir = Cavir_->colspi()[0];
-    int nao = cuest_primary_basis_->nbf();
-    int naux = cuest_auxiliary_basis_->nbf();
-    
-    // pointers to row-major data
-    double* Cleft = Caocc_->pointer()[0];
-    double* Cright = Cavir_->pointer()[0];
-    
-    // set up device buffers
-    double* d_Cleft = nullptr;
-    double* d_Cright = nullptr;
-    
-    CHECK_CUDA(cudaMalloc((void**) &d_Cleft, sizeof(double) * naocc * nao));
-    CHECK_CUDA(cudaMalloc((void**) &d_Cright, sizeof(double) * navir * nao));
-    CHECK_CUDA(cudaMalloc((void**) &Bia_, naux * naocc * navir * sizeof(double)));
-    
-    // copy data to device
-    CHECK_CUDA(cudaMemcpy(d_Cleft, Cleft, sizeof(double) * naocc * nao, cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_Cright, Cright, sizeof(double) * navir * nao, cudaMemcpyHostToDevice));
-    
-    // code below is adapted from the CUDALibrarySamples MO ints example
-    
-    // presently there are no configurable parameters for MO ints
-    cuestDFMOIntegralsComputeParameters_t params;
-    CHECK_CUEST(cuestParametersCreate(
-        CUEST_DFMOINTEGRALSCOMPUTE_PARAMETERS,
-        reinterpret_cast<void**>(&params)));
-    
-    // extra temporary device buffer to help form Bia
-    cuestWorkspaceDescriptor_t* variableBufferSize = (cuestWorkspaceDescriptor_t*) malloc(sizeof(cuestWorkspaceDescriptor_t));
-    variableBufferSize->hostBufferSizeInBytes = 0;
-    variableBufferSize->deviceBufferSizeInBytes = 2000000000;
+    size_t naocc = Caocc_->colspi()[0];
+    size_t navir = Cavir_->colspi()[0];
+    size_t naux = ribasis_->nbf();
 
-    cuestWorkspaceDescriptor_t* temporaryWorkspaceDescriptor = (cuestWorkspaceDescriptor_t*) malloc(sizeof(cuestWorkspaceDescriptor_t));
-    
-    // workspace query to determine temporary space needed to form Bia
-    CHECK_CUEST(cuestDFMOIntegralsComputeWorkspaceQuery(
-        cuest_handle,
-        cuest_df_plan_,
-        params,
-        variableBufferSize,
-        temporaryWorkspaceDescriptor,
-        1,
-        naocc,
-        navir,
-        d_Cleft,
-        d_Cright,
-        Bia_));
-    
-    cuestWorkspace_t* temporaryDFMOWorkspace = cuest_common::allocateWorkspace(temporaryWorkspaceDescriptor);
-    
-    // compute DF MO integrals Bia = (A|ia)
-    CHECK_CUEST(cuestDFMOIntegralsCompute(
-        cuest_handle,
-        cuest_df_plan_,
-        params,
-        variableBufferSize,
-        temporaryDFMOWorkspace,
-        1,
-        naocc,
-        navir,
-        d_Cleft,
-        d_Cright,
-        Bia_));
-
-    // destroy parameters
-    CHECK_CUEST(cuestParametersDestroy(
-        CUEST_DFMOINTEGRALSCOMPUTE_PARAMETERS,
-        params));
-    
-    // free buffers
-    free(variableBufferSize);
-    free(temporaryWorkspaceDescriptor);
-    cuest_common::freeWorkspace(temporaryDFMOWorkspace);
-    
-    cudaFree((void*) d_Cleft);
-    cudaFree((void*) d_Cright);
+    cuESTMOInts mo_ints(basisset_, ribasis_, options_);
+    CHECK_CUDA(cudaMalloc((void**) &Bia_, sizeof(double) * naux * naocc * navir));
+    mo_ints.compute_3c_ints(Caocc_, Cavir_, Bia_);
 #else
     SharedMatrix Jm12 = form_inverse_metric();
     apply_fitting(Jm12, PSIF_DFMP2_AIA, ribasis_->nbf(), Caocc_->colspi()[0] * (size_t)Cavir_->colspi()[0]);
@@ -1141,7 +1060,7 @@ void RDFMP2::form_energy() {
     int naocc = Caocc_->colspi()[0];
     int navir = Cavir_->colspi()[0];
 #ifdef USING_cuEST
-    int naux = cuest_auxiliary_basis_->nbf();
+    int naux = ribasis_->nbf();
     
     int naocc2 = naocc * naocc;
     int navir2 = navir * navir;
