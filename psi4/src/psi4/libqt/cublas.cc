@@ -30,19 +30,7 @@
 
 #ifdef USING_cuEST
 #include <cublas_v2.h>
-
-// Helper macros
-#define CHECK_CUBLAS(call) \
-    do { \
-        cublasStatus_t st__ = (call); \
-        if (st__ != CUBLAS_STATUS_SUCCESS) return static_cast<int>(st__); \
-    } while (0)
-
-// #define CHECK_CUDA(call) \
-//     do { \
-//         cudaError_t err__ = (call); \
-//         if (err__ != cudaSuccess) return static_cast<int>(err__); \
-//     } while (0)
+#include "psi4/libfock/cuESTCommon.h"
 
 namespace psi {
 
@@ -65,8 +53,8 @@ void C_DGEMM_CUBLAS(
                 (transa ? CUBLAS_OP_T : CUBLAS_OP_N),
                 n, m, k,
                 &alpha_arg,
-                (B + offb), int ldb,
-                (A + offa), int lda,
+                (B + offb), ldb,
+                (A + offa), lda,
                 &beta_arg,
                 C, ldc));
 }

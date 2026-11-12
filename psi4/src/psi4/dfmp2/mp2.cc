@@ -58,8 +58,11 @@
 
 #ifdef USING_cuEST
 #include <cuest.h>
-#include <cublas_v2>
-#include <mp2_kernels.h>
+#include <cublas_v2.h>
+
+#include "mp2_kernels.h"
+#include "psi4/libfock/cuESTCommon.h"
+#include "psi4/libfock/cuESTJK.h"
 
 extern cudaStream_t stream_handle;
 extern cuestHandle_t cuest_handle;
@@ -192,6 +195,8 @@ void DFMP2::common_init() {
     sss_ = options_.get_double("MP2_SS_SCALE");
     oss_ = options_.get_double("MP2_OS_SCALE");
 
+    ribasis_ = get_basisset("DF_BASIS_MP2");
+
 #ifdef USING_cuEST
     cuest_common::ensure_cuest_initialized();
 
@@ -200,8 +205,6 @@ void DFMP2::common_init() {
     
     std::shared_ptr<cuESTJK> cuest_jk = std::dynamic_pointer_cast<cuESTJK>(jk_);
     cuestDFIntPlan_t cuest_df_plan_ = cuest_jk->cuest_df_plan();
-#else
-    ribasis_ = get_basisset("DF_BASIS_MP2");
 #endif
 }
 double DFMP2::compute_energy() {
@@ -821,13 +824,6 @@ void RDFMP2::common_init() {
     eps_aocc_ = epsilon_a_subset("AO", "ACTIVE_OCC");
     eps_avir_ = epsilon_a_subset("AO", "ACTIVE_VIR");
     eps_fvir_ = epsilon_a_subset("AO", "FROZEN_VIR");
-
-#ifdef USING_cuEST
-    double* Bia_ = nullptr;
-    double* iajb_ = nullptr;
-    double* ibja_ = nullptr;
-    double* iajb_d_ = nullptr;
-#endif
     
 }
 void RDFMP2::print_header() {
@@ -1056,7 +1052,7 @@ void RDFMP2::form_Bia() {
     
     // set up device buffers
     double* d_Cleft = nullptr;
-    double* d_Cleft = nullptr;
+    double* d_Cright = nullptr;
     
     CHECK_CUDA(cudaMalloc((void**) &d_Cleft, sizeof(double) * naocc * nao));
     CHECK_CUDA(cudaMalloc((void**) &d_Cright, sizeof(double) * navir * nao));
@@ -1064,20 +1060,22 @@ void RDFMP2::form_Bia() {
     
     // copy data to device
     CHECK_CUDA(cudaMemcpy(d_Cleft, Cleft, sizeof(double) * naocc * nao, cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_Cleft, Cleft, sizeof(double) * navir * nao, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_Cright, Cright, sizeof(double) * navir * nao, cudaMemcpyHostToDevice));
     
     // code below is adapted from the CUDALibrarySamples MO ints example
     
     // presently there are no configurable parameters for MO ints
     cuestDFMOIntegralsComputeParameters_t params;
-    checkCuestErrors(cuestParametersCreate(
+    CHECK_CUEST(cuestParametersCreate(
         CUEST_DFMOINTEGRALSCOMPUTE_PARAMETERS,
-        &params));
+        reinterpret_cast<void**>(&params)));
     
     // extra temporary device buffer to help form Bia
     cuestWorkspaceDescriptor_t* variableBufferSize = (cuestWorkspaceDescriptor_t*) malloc(sizeof(cuestWorkspaceDescriptor_t));
     variableBufferSize->hostBufferSizeInBytes = 0;
     variableBufferSize->deviceBufferSizeInBytes = 2000000000;
+
+    cuestWorkspaceDescriptor_t* temporaryWorkspaceDescriptor = (cuestWorkspaceDescriptor_t*) malloc(sizeof(cuestWorkspaceDescriptor_t));
     
     // workspace query to determine temporary space needed to form Bia
     CHECK_CUEST(cuestDFMOIntegralsComputeWorkspaceQuery(
@@ -1093,7 +1091,7 @@ void RDFMP2::form_Bia() {
         d_Cright,
         Bia_));
     
-    cuestWorkspace_t* temporaryDFMOWorkspace = allocateWorkspace(temporaryWorkspaceDescriptor);
+    cuestWorkspace_t* temporaryDFMOWorkspace = cuest_common::allocateWorkspace(temporaryWorkspaceDescriptor);
     
     // compute DF MO integrals Bia = (A|ia)
     CHECK_CUEST(cuestDFMOIntegralsCompute(
@@ -1108,17 +1106,19 @@ void RDFMP2::form_Bia() {
         d_Cleft,
         d_Cright,
         Bia_));
-    
-    // free buffers
-    free(variableBufferSize);
-    cuest_common::freeWorkspace(temporaryDFMOWorkspace);
-    
+
+    // destroy parameters
     CHECK_CUEST(cuestParametersDestroy(
         CUEST_DFMOINTEGRALSCOMPUTE_PARAMETERS,
         params));
     
-    CHECK_CUDA(cudaFree((void*) d_Cleft));
-    CHECK_CUDA(cudaFree((void*) d_Cright));
+    // free buffers
+    free(variableBufferSize);
+    free(temporaryWorkspaceDescriptor);
+    cuest_common::freeWorkspace(temporaryDFMOWorkspace);
+    
+    cudaFree((void*) d_Cleft);
+    cudaFree((void*) d_Cright);
 #else
     SharedMatrix Jm12 = form_inverse_metric();
     apply_fitting(Jm12, PSIF_DFMP2_AIA, ribasis_->nbf(), Caocc_->colspi()[0] * (size_t)Cavir_->colspi()[0]);
@@ -1147,40 +1147,44 @@ void RDFMP2::form_energy() {
     int navir2 = navir * navir;
 
     // allocate scratch buffers on GPU
-    CHECK_CUDA(cudaMalloc((void**) &iajb_, navir2));
-    CHECK_CUDA(cudaMalloc((void**) &ibja_, navir2));
-    CHECK_CUDA(cudaMalloc((void**) &iajb_d_, navir2));
+    double* iajb = nullptr;
+    double* ibja = nullptr;
+    double* iajb_d = nullptr;
+    
+    CHECK_CUDA(cudaMalloc((void**) &iajb, sizeof(double) * navir2));
+    CHECK_CUDA(cudaMalloc((void**) &ibja, sizeof(double) * navir2));
+    CHECK_CUDA(cudaMalloc((void**) &iajb_d, sizeof(double) * navir2));
 
-    // orbital energies
+    // copy orbital energies to GPU
     double* deps_aocc = nullptr;
     double* deps_avir = nullptr;
 
     CHECK_CUDA(cudaMalloc((void**) &deps_aocc, sizeof(double) * naocc));
     CHECK_CUDA(cudaMalloc((void**) &deps_avir, sizeof(double) * navir));
     
-    CHECK_CUDA(cudaMemcpy(deps_aocc, eps_aocc_, sizeof(double) * naocc, cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(deps_avir, eps_avir_, sizeof(double) * navir, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(deps_aocc, eps_aocc_->pointer(), sizeof(double) * naocc, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(deps_avir, eps_avir_->pointer(), sizeof(double) * navir, cudaMemcpyHostToDevice));
 
-    for (int i = 0; i < navir; i++) {
-        for (int j = 0; j < i; j++) {
+    for (int i = 0; i < naocc; i++) {
+        for (int j = i; j < naocc; j++) {
             
             double iajb_term = 0.0;
             double ibja_term = 0.0;
             
             // For fixed i,j do (i a | j b) = sum_A B[A, i, a] * B[A, j, b] 
             C_DGEMM_CUBLAS(cublas_handle, true, false, navir, navir, naux,
-                1.0, Bia_, i*navir, naocc*navir, Bia_, j*navir, naocc*navir, 0.0, iajb_, navir);
+                1.0, Bia_, i*navir, naocc*navir, Bia_, j*navir, naocc*navir, 0.0, iajb, navir);
     
             // (i a | j b) => (i b | j a)
             C_DGEAM_CUBLAS(cublas_handle, true, false, navir, navir, 
-                1, iajb_, navir, 0, nullptr, navir, ibja_, navir);
+                1, iajb, navir, 0, nullptr, navir, ibja, navir);
     
             // form (i a | j b) / (eps[i] + eps[j] - eps[a] - eps[b])
-            pair_amplitudes_ij(i, j, navir, deps_aocc, deps_avir, iajb_, iajb_d_, stream_handle);
+            pair_amplitudes_ij(i, j, navir, iajb, deps_aocc, deps_avir, iajb_d, stream_handle);
     
             // costs a host sync each iteration (very expensive!) 
-            C_DDOT_CUBLAS(cublas_handle, navir2, iajb_, 0, 1, iajb_d_, 0, 1, &iajb_term);
-            C_DDOT_CUBLAS(cublas_handle, navir2, ibja_, 0, 1, iajb_d_, 0, 1, &ibja_term);
+            C_DDOT_CUBLAS(cublas_handle, navir2, iajb, 0, 1, iajb_d, 0, 1, &iajb_term);
+            C_DDOT_CUBLAS(cublas_handle, navir2, ibja, 0, 1, iajb_d, 0, 1, &ibja_term);
     
             // accumulate os & ss on the CPU
             double pair_prefactor = (i == j) ? 1.0 : 2.0;
@@ -1189,9 +1193,14 @@ void RDFMP2::form_energy() {
         }
     }
 
-    CHECK_CUDA(cudaFree((void*) deps_aocc));
-    CHECK_CUDA(cudaFree((void*) deps_avir));
-    
+    cudaFree((void*) Bia_);
+    cudaFree((void*) iajb);
+    cudaFree((void*) ibja);
+    cudaFree((void*) iajb_d);
+
+    cudaFree((void*) deps_aocc);
+    cudaFree((void*) deps_avir);
+
 #else // not USING_cuEST
     int naux = ribasis_->nbf();
 

@@ -132,6 +132,9 @@ class RDFMP2 : public DFMP2 {
     SharedVector eps_aocc_;
     SharedVector eps_avir_;
     SharedVector eps_fvir_;
+#ifdef USING_cuEST
+    double* Bia_ = nullptr;
+#endif
 
     void common_init();
 

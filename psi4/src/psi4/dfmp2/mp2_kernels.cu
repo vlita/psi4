@@ -19,25 +19,25 @@ void make_pair_amplitudes_ij(
 
     if (rel_a < nvir && rel_b < nvir) {
         double denominator = eps_occ[i] + eps_occ[j] - eps_vir[rel_a] - eps_vir[rel_b];
-        double numerator = pair_mo_ints[rel_a * nvir + rel_b];
-        pair_amplitudes[rel_a * nvir + rel_b] = numerator * (fabs(denominator) < 1e-20 ? 1e20 : 1.0 / denominator);
+        double numerator = iajb[rel_a * nvir + rel_b];
+        iajb_d[rel_a * nvir + rel_b] = numerator * (fabs(denominator) < 1e-20 ? 1e20 : 1.0 / denominator);
     }
 }
 
 void pair_amplitudes_ij(
-    int i, 
+    int i,
     int j,
     int nvir,
+    const double* iajb,
     const double* eps_occ,
     const double* eps_vir,
-    const double* iajb,
     double* iajb_d,
     cudaStream_t stream
 ) {
     // schedule thread blocks of 256 elements each (16x16)
     dim3 DimGrid((nvir + 16 - 1) / 16, (nvir + 16 - 1) / 16, 1);
     dim3 DimBlock(16, 16, 1);
-    make_pair_amplitudes_ij<<<DimGrid, DimBlock, 0, stream>>>(i, j, nvir, eps_occ, eps_vir, iajb, iajb_d);
+    make_pair_amplitudes_ij<<<DimGrid, DimBlock, 0, stream>>>(i, j, nvir, iajb, eps_occ, eps_vir, iajb_d);
 }
 
 #endif // USING_cuEST

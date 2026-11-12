@@ -157,7 +157,7 @@ void C_DGEMM(char transa, char transb, int m, int n, int k, double alpha, double
              double beta, double* c, int ldc);
 
 #ifdef USING_cuEST
-void C_DGEMM_CUBLAS(cublasHandle_t handle, bool transa, bool transb, int m, int n, int k, const double* alpha, const double* A, int offa, int lda, const double* B, int offb, int ldb, const double* beta, double* C, int ldc);
+void C_DGEMM_CUBLAS(cublasHandle_t handle, bool transa, bool transb, int m, int n, int k, double alpha, const double* A, int offa, int lda, const double* B, int offb, int ldb, double beta, double* C, int ldc);
 void C_DGEAM_CUBLAS(cublasHandle_t handle, bool transa, bool transb, int m, int n, double alpha, const double* A, int lda, double beta, const double* B, int ldb, double* C, int ldc);
 #endif
 

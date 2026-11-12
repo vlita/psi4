@@ -58,6 +58,7 @@
 #include "psi4/psi4-dec.h"
 #include "psi4/libfock/cuESTCommon.h"
 #include "psi4/libpsi4util/PsiOutStream.h"
+#include "psi4/libpsi4util/process.h"
 #include "psi4/libpsi4util/exception.h"
 
 #include "cuest_runtime.h"
@@ -291,7 +292,7 @@ void cuest_init() {
             throw PSIEXCEPTION("cublasCreate failed in cuest_init");
         }
 
-        if (options.get_str("CUBLAS_MIXED_PRECISION") == "Enabled") {
+        if (psi::Process::environment.options.get_str("CUBLAS_MIXED_PRECISION") == "ENABLED") {
             cublasStatus_t math_status = cublasSetMathMode(cublas_handle, CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH);
             if (math_status != CUBLAS_STATUS_SUCCESS) {
                 throw PSIEXCEPTION("cublasSetMathMode failed in cuest_init");
