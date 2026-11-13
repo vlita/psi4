@@ -853,17 +853,11 @@ void RDFMP2::print_header() {
 
 #ifdef USING_cuEST
     if (!use_cuest_) return;
-
-    cuestMathMode_t cuest_mode;
-    CHECK_CUEST(cuestGetMathMode(cuest_handle, &cuest_mode));
     
-    cublasMath_t cublas_mode;
-    CHECK_CUBLAS(cublasGetMathMode(cublas_handle, &cublas_mode));
-
     double peak_device_memory_estimate = (static_cast<double>(ribasis_->nbf()) * aocc * avir + 3.0 * avir * avir + avir + aocc) * sizeof(double) / (1024.0 * 1024.0 * 1024.0);
 
-    const char *cuest_str  = (cuest_mode == CUEST_DEFAULT_MATH_MODE)  ? "enabled"  : "disabled";
-    const char *cublas_str = (cublas_mode & CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH) ? "enabled"  : "disabled";
+    const char *cuest_str  = (options_.get_bool("CUEST_MIXED_PRECISION"))  ? "enabled"  : "disabled";
+    const char *cublas_str = (options_.get_str("CUBLAS_MIXED_PRECISION") == "ENABLED") ? "enabled"  : "disabled";
 
     outfile->Printf("\t -----------------------------\n");
     outfile->Printf("\t    GPU-Accelerated DF-MP2    \n");
@@ -1217,6 +1211,10 @@ void RDFMP2::form_energy_cuest() {
     
     CHECK_CUDA(cudaMemcpy(deps_aocc, eps_aocc_->pointer(), sizeof(double) * naocc, cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(deps_avir, eps_avir_->pointer(), sizeof(double) * navir, cudaMemcpyHostToDevice));
+ 
+    if (options_.get_str("CUBLAS_MIXED_PRECISION") == "ENABLED") {
+        CHECK_CUBLAS(cublasSetMathMode(cublas_handle, CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH));
+    }
 
     for (int i = 0; i < naocc; i++) {
         for (int j = i; j < naocc; j++) {
@@ -1245,6 +1243,8 @@ void RDFMP2::form_energy_cuest() {
             e_ss += pair_prefactor * (iajb_term - ibja_term);
         }
     }
+    // cuEST shares this handle and requires that cuBLAS emulation parameters should be reset prior to calling cuEST
+    CHECK_CUBLAS(cublasSetMathMode(cublas_handle, CUBLAS_DEFAULT_MATH));
 
     cudaFree((void*) Bia_);
     cudaFree((void*) iajb);
