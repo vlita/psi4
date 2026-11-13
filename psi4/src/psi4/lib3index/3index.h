@@ -36,5 +36,5 @@
 #endif
 
 #ifdef USING_cuEST
-#include "cuESTMOInts.cc"
+#include "cuESTMOInts.h"
 #endif
