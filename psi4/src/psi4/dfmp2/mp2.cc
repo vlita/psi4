@@ -196,10 +196,6 @@ void DFMP2::common_init() {
     oss_ = options_.get_double("MP2_OS_SCALE");
 
     ribasis_ = get_basisset("DF_BASIS_MP2");
-
-#ifdef USING_cuEST
-    cuest_common::ensure_cuest_initialized();
-#endif
 }
 double DFMP2::compute_energy() {
     print_header();
@@ -215,27 +211,21 @@ double DFMP2::compute_energy() {
         energy_ = variables_["MP2 TOTAL ENERGY"];
         return variables_["MP2 TOTAL ENERGY"];
     }
-#ifdef USING_cuEST
+
+    if (!use_cuest_) {
+        timer_on("DFMP2 Singles");
+        form_singles();
+        timer_off("DFMP2 Singles");
+        timer_on("DFMP2 Aia");
+        form_Aia();
+        timer_off("DFMP2 Aia");
+    }
     timer_on("DFMP2 Bia");
     form_Bia();
     timer_off("DFMP2 Bia");
     timer_on("DFMP2 Energy");
     form_energy();
     timer_off("DFMP2 Energy");
-#else 
-    timer_on("DFMP2 Singles");
-    form_singles();
-    timer_off("DFMP2 Singles");
-    timer_on("DFMP2 Aia");
-    form_Aia();
-    timer_off("DFMP2 Aia");
-    timer_on("DFMP2 Bia");
-    form_Bia();
-    timer_off("DFMP2 Bia");
-    timer_on("DFMP2 Energy");
-    form_energy();
-    timer_off("DFMP2 Energy");
-#endif
     print_energies();
     energy_ = variables_["MP2 TOTAL ENERGY"];
 
@@ -818,7 +808,13 @@ void RDFMP2::common_init() {
     eps_aocc_ = epsilon_a_subset("AO", "ACTIVE_OCC");
     eps_avir_ = epsilon_a_subset("AO", "ACTIVE_VIR");
     eps_fvir_ = epsilon_a_subset("AO", "FROZEN_VIR");
-    
+
+#ifdef USING_cuEST
+    use_cuest_ = options_.get_bool("USE_CUEST");
+    if (use_cuest_) {
+        cuest_common::ensure_cuest_initialized();
+    }
+#endif
 }
 void RDFMP2::print_header() {
     int nthread = 1;
@@ -856,6 +852,8 @@ void RDFMP2::print_header() {
     outfile->Printf("\t --------------------------------------------------------\n\n");
 
 #ifdef USING_cuEST
+    if (!use_cuest_) return;
+
     cuestMathMode_t cuest_mode;
     CHECK_CUEST(cuestGetMathMode(cuest_handle, &cuest_mode));
     
@@ -870,9 +868,6 @@ void RDFMP2::print_header() {
     outfile->Printf("\t -----------------------------\n");
     outfile->Printf("\t    GPU-Accelerated DF-MP2    \n");
     outfile->Printf("\t   w/ NVIDIA cuEST & cuBLAS   \n");
-    outfile->Printf("\t                              \n");
-    outfile->Printf("\t        Victor L. Lita        \n");
-    outfile->Printf("\t -----------------------------\n");
     outfile->Printf("\t -----------------------------\n");
     outfile->Printf("\t  Algorithm: low memory       \n");
     outfile->Printf("\t                              \n");
@@ -1031,6 +1026,16 @@ void RDFMP2::form_Aia() {
 }
 void RDFMP2::form_Bia() {
 #ifdef USING_cuEST
+    if (use_cuest_) {
+        form_Bia_cuest();
+        return;
+    }
+#endif
+    SharedMatrix Jm12 = form_inverse_metric();
+    apply_fitting(Jm12, PSIF_DFMP2_AIA, ribasis_->nbf(), Caocc_->colspi()[0] * (size_t)Cavir_->colspi()[0]);
+}
+#ifdef USING_cuEST
+void RDFMP2::form_Bia_cuest() {
     size_t naocc = Caocc_->colspi()[0];
     size_t navir = Cavir_->colspi()[0];
     size_t naux = ribasis_->nbf();
@@ -1038,11 +1043,8 @@ void RDFMP2::form_Bia() {
     cuESTMOInts mo_ints(basisset_, ribasis_, options_);
     CHECK_CUDA(cudaMalloc((void**) &Bia_, sizeof(double) * naux * naocc * navir));
     mo_ints.compute_3c_ints(Caocc_, Cavir_, Bia_);
-#else
-    SharedMatrix Jm12 = form_inverse_metric();
-    apply_fitting(Jm12, PSIF_DFMP2_AIA, ribasis_->nbf(), Caocc_->colspi()[0] * (size_t)Cavir_->colspi()[0]);
-#endif
 }
+#endif
 void RDFMP2::form_Bia_Cia() {
     SharedMatrix Jm12 = form_inverse_metric();
     apply_fitting(Jm12, PSIF_DFMP2_AIA, ribasis_->nbf(), Caocc_->colspi()[0] * (size_t)Cavir_->colspi()[0]);
@@ -1052,6 +1054,12 @@ void RDFMP2::form_Bia_transpose() {
     apply_B_transpose(PSIF_DFMP2_AIA, ribasis_->nbf(), Caocc_->colspi()[0], (size_t)Cavir_->colspi()[0]);
 }
 void RDFMP2::form_energy() {
+#ifdef USING_cuEST
+    if (use_cuest_) {
+        form_energy_cuest();
+        return;
+    }
+#endif
     // Energy registers
     double e_ss = 0.0;
     double e_os = 0.0;
@@ -1059,68 +1067,6 @@ void RDFMP2::form_energy() {
     // Sizing
     int naocc = Caocc_->colspi()[0];
     int navir = Cavir_->colspi()[0];
-#ifdef USING_cuEST
-    int naux = ribasis_->nbf();
-    
-    int naocc2 = naocc * naocc;
-    int navir2 = navir * navir;
-
-    // allocate scratch buffers on GPU
-    double* iajb = nullptr;
-    double* ibja = nullptr;
-    double* iajb_d = nullptr;
-    
-    CHECK_CUDA(cudaMalloc((void**) &iajb, sizeof(double) * navir2));
-    CHECK_CUDA(cudaMalloc((void**) &ibja, sizeof(double) * navir2));
-    CHECK_CUDA(cudaMalloc((void**) &iajb_d, sizeof(double) * navir2));
-
-    // copy orbital energies to GPU
-    double* deps_aocc = nullptr;
-    double* deps_avir = nullptr;
-
-    CHECK_CUDA(cudaMalloc((void**) &deps_aocc, sizeof(double) * naocc));
-    CHECK_CUDA(cudaMalloc((void**) &deps_avir, sizeof(double) * navir));
-    
-    CHECK_CUDA(cudaMemcpy(deps_aocc, eps_aocc_->pointer(), sizeof(double) * naocc, cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(deps_avir, eps_avir_->pointer(), sizeof(double) * navir, cudaMemcpyHostToDevice));
-
-    for (int i = 0; i < naocc; i++) {
-        for (int j = i; j < naocc; j++) {
-            
-            double iajb_term = 0.0;
-            double ibja_term = 0.0;
-            
-            // For fixed i,j do (i a | j b) = sum_A B[A, i, a] * B[A, j, b] 
-            C_DGEMM_CUBLAS(cublas_handle, true, false, navir, navir, naux,
-                1.0, Bia_, i*navir, naocc*navir, Bia_, j*navir, naocc*navir, 0.0, iajb, navir);
-    
-            // (i a | j b) => (i b | j a)
-            C_DGEAM_CUBLAS(cublas_handle, true, false, navir, navir, 
-                1, iajb, navir, 0, nullptr, navir, ibja, navir);
-    
-            // form (i a | j b) / (eps[i] + eps[j] - eps[a] - eps[b])
-            pair_amplitudes_ij(i, j, navir, iajb, deps_aocc, deps_avir, iajb_d, stream_handle);
-    
-            // costs a host sync each iteration (very expensive!) 
-            C_DDOT_CUBLAS(cublas_handle, navir2, iajb, 0, 1, iajb_d, 0, 1, &iajb_term);
-            C_DDOT_CUBLAS(cublas_handle, navir2, ibja, 0, 1, iajb_d, 0, 1, &ibja_term);
-    
-            // accumulate os & ss on the CPU
-            double pair_prefactor = (i == j) ? 1.0 : 2.0;
-            e_os += pair_prefactor * iajb_term;
-            e_ss += pair_prefactor * (iajb_term - ibja_term);
-        }
-    }
-
-    cudaFree((void*) Bia_);
-    cudaFree((void*) iajb);
-    cudaFree((void*) ibja);
-    cudaFree((void*) iajb_d);
-
-    cudaFree((void*) deps_aocc);
-    cudaFree((void*) deps_avir);
-
-#else // not USING_cuEST
     int naux = ribasis_->nbf();
 
     // Thread considerations
@@ -1235,11 +1181,83 @@ void RDFMP2::form_energy() {
         }
     }
     psio_->close(PSIF_DFMP2_AIA, 0);
-#endif // not USING_cuEST
 
     variables_["MP2 SAME-SPIN CORRELATION ENERGY"] = e_ss;
     variables_["MP2 OPPOSITE-SPIN CORRELATION ENERGY"] = e_os;
 }
+#ifdef USING_cuEST
+void RDFMP2::form_energy_cuest() {
+    // Energy registers
+    double e_ss = 0.0;
+    double e_os = 0.0;
+
+    // Sizing
+    int naocc = Caocc_->colspi()[0];
+    int navir = Cavir_->colspi()[0];
+    int naux = ribasis_->nbf();
+    
+    int naocc2 = naocc * naocc;
+    int navir2 = navir * navir;
+
+    // allocate scratch buffers on GPU
+    double* iajb = nullptr;
+    double* ibja = nullptr;
+    double* iajb_d = nullptr;
+    
+    CHECK_CUDA(cudaMalloc((void**) &iajb, sizeof(double) * navir2));
+    CHECK_CUDA(cudaMalloc((void**) &ibja, sizeof(double) * navir2));
+    CHECK_CUDA(cudaMalloc((void**) &iajb_d, sizeof(double) * navir2));
+
+    // copy orbital energies to GPU
+    double* deps_aocc = nullptr;
+    double* deps_avir = nullptr;
+
+    CHECK_CUDA(cudaMalloc((void**) &deps_aocc, sizeof(double) * naocc));
+    CHECK_CUDA(cudaMalloc((void**) &deps_avir, sizeof(double) * navir));
+    
+    CHECK_CUDA(cudaMemcpy(deps_aocc, eps_aocc_->pointer(), sizeof(double) * naocc, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(deps_avir, eps_avir_->pointer(), sizeof(double) * navir, cudaMemcpyHostToDevice));
+
+    for (int i = 0; i < naocc; i++) {
+        for (int j = i; j < naocc; j++) {
+            
+            double iajb_term = 0.0;
+            double ibja_term = 0.0;
+            
+            // For fixed i,j do (i a | j b) = sum_A B[A, i, a] * B[A, j, b] 
+            C_DGEMM_CUBLAS(cublas_handle, true, false, navir, navir, naux,
+                1.0, Bia_, i*navir, naocc*navir, Bia_, j*navir, naocc*navir, 0.0, iajb, navir);
+    
+            // (i a | j b) => (i b | j a)
+            C_DGEAM_CUBLAS(cublas_handle, true, false, navir, navir, 
+                1, iajb, navir, 0, nullptr, navir, ibja, navir);
+    
+            // form (i a | j b) / (eps[i] + eps[j] - eps[a] - eps[b])
+            pair_amplitudes_ij(i, j, navir, iajb, deps_aocc, deps_avir, iajb_d, stream_handle);
+    
+            // costs a host sync each iteration (very expensive!) 
+            C_DDOT_CUBLAS(cublas_handle, navir2, iajb, 0, 1, iajb_d, 0, 1, &iajb_term);
+            C_DDOT_CUBLAS(cublas_handle, navir2, ibja, 0, 1, iajb_d, 0, 1, &ibja_term);
+    
+            // accumulate os & ss on the CPU
+            double pair_prefactor = (i == j) ? 1.0 : 2.0;
+            e_os += pair_prefactor * iajb_term;
+            e_ss += pair_prefactor * (iajb_term - ibja_term);
+        }
+    }
+
+    cudaFree((void*) Bia_);
+    cudaFree((void*) iajb);
+    cudaFree((void*) ibja);
+    cudaFree((void*) iajb_d);
+
+    cudaFree((void*) deps_aocc);
+    cudaFree((void*) deps_avir);
+
+    variables_["MP2 SAME-SPIN CORRELATION ENERGY"] = e_ss;
+    variables_["MP2 OPPOSITE-SPIN CORRELATION ENERGY"] = e_os;
+}
+#endif  // USING_cuEST
 void RDFMP2::form_Pab() {
     // Energy registers
     double e_ss = 0.0;
