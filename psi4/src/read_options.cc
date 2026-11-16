@@ -179,6 +179,8 @@ int read_options(const std::string &name, Options &options, bool suppress_printi
     options.add_int("CUEST_DFK_MODULI", 8);
     /*- Whether to allow post-scf calculations utilizing cuBLAS to use mixed precision emulation (requires CUDA and cuEST libraries) -*/
     options.add_str("CUBLAS_MIXED_PRECISION", "ENABLED", "ENABLED DISABLED");
+    /*- Whether GPU DF-MP2 forms (ia|jb) for batches of occupied orbitals at once, using as much free device memory as available (requires CUDA and cuEST libraries) -*/
+    options.add_bool("HIGH_MEM_MP2", false);
 
     // Note that case-insensitive options are only functional as
     //   globals, not as module-level, and should be defined sparingly

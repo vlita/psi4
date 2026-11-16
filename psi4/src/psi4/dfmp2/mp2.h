@@ -138,6 +138,7 @@ class RDFMP2 : public DFMP2 {
     SharedVector eps_fvir_;
 #ifdef USING_cuEST
     double* Bia_ = nullptr;
+    bool high_mem_ = false;
 #endif
 
     void common_init();

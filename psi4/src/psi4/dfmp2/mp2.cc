@@ -28,6 +28,9 @@
 
 #include "mp2.h"
 
+#include <algorithm>
+#include <climits>
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -811,6 +814,7 @@ void RDFMP2::common_init() {
 
 #ifdef USING_cuEST
     use_cuest_ = options_.get_bool("USE_CUEST");
+    high_mem_ = options_.get_bool("HIGH_MEM_MP2");
     if (use_cuest_) {
         cuest_common::ensure_cuest_initialized();
     }
@@ -854,7 +858,9 @@ void RDFMP2::print_header() {
 #ifdef USING_cuEST
     if (!use_cuest_) return;
     
-    double peak_device_memory_estimate = (static_cast<double>(ribasis_->nbf()) * aocc * avir + 3.0 * avir * avir + avir + aocc) * sizeof(double) / (1024.0 * 1024.0 * 1024.0);
+    // high memory: 3 scratch buffers of at least one occupied slice (aocc * avir^2) each, grown to fill free memory
+    double scratch_doubles = high_mem_ ? 3.0 * aocc * avir * avir : 3.0 * avir * avir;
+    double peak_device_memory_estimate = (static_cast<double>(ribasis_->nbf()) * aocc * avir + scratch_doubles + avir + aocc) * sizeof(double) / (1024.0 * 1024.0 * 1024.0);
 
     const char *cuest_str  = (options_.get_bool("CUEST_MIXED_PRECISION"))  ? "enabled"  : "disabled";
     const char *cublas_str = (options_.get_str("CUBLAS_MIXED_PRECISION") == "ENABLED") ? "enabled"  : "disabled";
@@ -863,14 +869,14 @@ void RDFMP2::print_header() {
     outfile->Printf("\t    GPU-Accelerated DF-MP2    \n");
     outfile->Printf("\t   w/ NVIDIA cuEST & cuBLAS   \n");
     outfile->Printf("\t -----------------------------\n");
-    outfile->Printf("\t  Algorithm: low memory       \n");
+    outfile->Printf("\t  Algorithm: %-11s      \n", high_mem_ ? "high memory" : "low memory");
     outfile->Printf("\t                              \n");
     outfile->Printf("\t  Fixed-point emulation       \n");
     outfile->Printf("\t  -------                     \n");
     outfile->Printf("\t   cuEST: %-8s            \n", cuest_str);
     outfile->Printf("\t   cuBLAS: %-8s           \n", cublas_str);
     outfile->Printf("\t                              \n");
-    outfile->Printf("\t  %6.2f GiB device scratch   \n", peak_device_memory_estimate);
+    outfile->Printf("\t  %6.2f GiB device scratch%s\n", peak_device_memory_estimate, high_mem_ ? " (min)" : "");
     outfile->Printf("\t -----------------------------\n");
     outfile->Printf("\n");
 #endif
@@ -1197,10 +1203,6 @@ void RDFMP2::form_energy_cuest() {
     double* iajb = nullptr;
     double* ibja = nullptr;
     double* iajb_d = nullptr;
-    
-    CHECK_CUDA(cudaMalloc((void**) &iajb, sizeof(double) * navir2));
-    CHECK_CUDA(cudaMalloc((void**) &ibja, sizeof(double) * navir2));
-    CHECK_CUDA(cudaMalloc((void**) &iajb_d, sizeof(double) * navir2));
 
     // copy orbital energies to GPU
     double* deps_aocc = nullptr;
@@ -1211,40 +1213,117 @@ void RDFMP2::form_energy_cuest() {
     
     CHECK_CUDA(cudaMemcpy(deps_aocc, eps_aocc_->pointer(), sizeof(double) * naocc, cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(deps_avir, eps_avir_->pointer(), sizeof(double) * navir, cudaMemcpyHostToDevice));
- 
-    if (options_.get_str("CUBLAS_MIXED_PRECISION") == "ENABLED") {
-        CHECK_CUBLAS(cublasSetMathMode(cublas_handle, CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH));
-    }
 
-    for (int i = 0; i < naocc; i++) {
-        for (int j = i; j < naocc; j++) {
-            
+    if (high_mem_) {
+        /*
+            HIGH-MEMORY DF-MP2 ALGORITHM
+        */
+
+        // one occupied slice holds (i a | j b) for a single i and all a, j, b
+        size_t slice_elements = static_cast<size_t>(naocc) * navir2;
+
+        // fit the 3 scratch buffers in 80% of free device memory, and keep each buffer's
+        // element count within cuBLAS's int arguments (the DDOT length below)
+        size_t free_bytes;
+        size_t total_bytes;
+        CHECK_CUDA(cudaMemGetInfo(&free_bytes, &total_bytes));
+
+        size_t slices_possible = static_cast<size_t>(0.8 * free_bytes) / 3 / (sizeof(double) * slice_elements);
+        slices_possible = std::min(slices_possible, static_cast<size_t>(INT_MAX) / slice_elements);
+        int slice_count = static_cast<int>(std::min(slices_possible, static_cast<size_t>(naocc)));
+        if (slice_count == 0) {
+            throw PSIEXCEPTION("DFMP2: a single occupied slice of (ia|jb) does not fit on the GPU; set HIGH_MEM_MP2 false");
+        }
+
+        size_t buffer_elements = slice_elements * slice_count;
+        CHECK_CUDA(cudaMalloc((void**) &iajb, sizeof(double) * buffer_elements));
+        CHECK_CUDA(cudaMalloc((void**) &ibja, sizeof(double) * buffer_elements));
+        CHECK_CUDA(cudaMalloc((void**) &iajb_d, sizeof(double) * buffer_elements));
+
+        // loop sizing
+        int nbatch = (naocc + slice_count - 1) / slice_count;
+        outfile->Printf("\t  Performing (A|ia)(A|jb) in %d batch(es) of up to %d occupied orbital(s)\n\n", nbatch, slice_count);
+
+        if (options_.get_str("CUBLAS_MIXED_PRECISION") == "ENABLED") {
+            CHECK_CUBLAS(cublasSetMathMode(cublas_handle, CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH));
+        }
+
+        for (int batch = 0; batch < nbatch; batch++) {
+
             double iajb_term = 0.0;
             double ibja_term = 0.0;
-            
-            // For fixed i,j do (i a | j b) = sum_A B[A, i, a] * B[A, j, b] 
-            C_DGEMM_CUBLAS(cublas_handle, true, false, navir, navir, naux,
-                1.0, Bia_, i*navir, naocc*navir, Bia_, j*navir, naocc*navir, 0.0, iajb, navir);
-    
-            // (i a | j b) => (i b | j a)
-            C_DGEAM_CUBLAS(cublas_handle, true, false, navir, navir, 
-                1, iajb, navir, 0, nullptr, navir, ibja, navir);
-    
-            // form (i a | j b) / (eps[i] + eps[j] - eps[a] - eps[b])
-            pair_amplitudes_ij(i, j, navir, iajb, deps_aocc, deps_avir, iajb_d, stream_handle);
-    
-            // costs a host sync each iteration (very expensive!) 
-            C_DDOT_CUBLAS(cublas_handle, navir2, iajb, 0, 1, iajb_d, 0, 1, &iajb_term);
-            C_DDOT_CUBLAS(cublas_handle, navir2, ibja, 0, 1, iajb_d, 0, 1, &ibja_term);
-    
-            // accumulate os & ss on the CPU
-            double pair_prefactor = (i == j) ? 1.0 : 2.0;
-            e_os += pair_prefactor * iajb_term;
-            e_ss += pair_prefactor * (iajb_term - ibja_term);
+
+            int i_start = batch * slice_count;
+            int iter_slices = std::min(slice_count, naocc - i_start);
+            int npairs = iter_slices * naocc;    // (i, j) blocks in this batch
+            int nelem = npairs * navir2;         // fits in int by the slice_count cap above
+
+            // (i a | j b)[ia_1 : ia_2, jb] = sum_A B[A, ia_1 : ia_2] * B[A, jb]
+            C_DGEMM_CUBLAS(cublas_handle, true, false, iter_slices * navir, naocc * navir, naux,
+                1.0, Bia_, i_start * navir, naocc * navir, Bia_, 0, naocc * navir, 0.0, iajb, naocc * navir);
+
+            // form (i a | j b) / (eps[i] + eps[j] - eps[a] - eps[b]) for every (i, j) block
+            pair_amplitudes_sliced(i_start, naocc, navir, npairs, iajb, deps_aocc, deps_avir, iajb_d, stream_handle);
+
+            // (i a | j b) => (i b | j a) within every (i, j) block
+            sliced_transpose(naocc, navir, npairs, iajb, ibja, stream_handle);
+
+            // one host sync per batch
+            C_DDOT_CUBLAS(cublas_handle, nelem, iajb, 0, 1, iajb_d, 0, 1, &iajb_term);
+            C_DDOT_CUBLAS(cublas_handle, nelem, ibja, 0, 1, iajb_d, 0, 1, &ibja_term);
+
+            // every (i, j) pair is summed explicitly, so no permutational prefactor
+            e_os += iajb_term;
+            e_ss += iajb_term - ibja_term;
         }
+        // cuEST shares this handle and requires that cuBLAS emulation parameters should be reset prior to calling cuEST
+        CHECK_CUBLAS(cublasSetMathMode(cublas_handle, CUBLAS_DEFAULT_MATH));
+        
+    } else {
+        /* 
+            LOW-MEMORY DF-MP2 ALGORITHM
+        */
+
+        // allocate scratch buffers
+        CHECK_CUDA(cudaMalloc((void**) &iajb, sizeof(double) * navir2));
+        CHECK_CUDA(cudaMalloc((void**) &ibja, sizeof(double) * navir2));
+        CHECK_CUDA(cudaMalloc((void**) &iajb_d, sizeof(double) * navir2));
+
+
+        if (options_.get_str("CUBLAS_MIXED_PRECISION") == "ENABLED") {
+            CHECK_CUBLAS(cublasSetMathMode(cublas_handle, CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH));
+        }
+    
+        for (int i = 0; i < naocc; i++) {
+            for (int j = i; j < naocc; j++) {
+                
+                double iajb_term = 0.0;
+                double ibja_term = 0.0;
+                
+                // For fixed i,j do (i a | j b) = sum_A B[A, i, a] * B[A, j, b] 
+                C_DGEMM_CUBLAS(cublas_handle, true, false, navir, navir, naux,
+                    1.0, Bia_, i*navir, naocc*navir, Bia_, j*navir, naocc*navir, 0.0, iajb, navir);
+        
+                // (i a | j b) => (i b | j a)
+                C_DGEAM_CUBLAS(cublas_handle, true, false, navir, navir, 
+                    1, iajb, navir, 0, nullptr, navir, ibja, navir);
+        
+                // form (i a | j b) / (eps[i] + eps[j] - eps[a] - eps[b])
+                pair_amplitudes_ij(i, j, navir, iajb, deps_aocc, deps_avir, iajb_d, stream_handle);
+        
+                // costs a host sync each iteration (very expensive!) 
+                C_DDOT_CUBLAS(cublas_handle, navir2, iajb, 0, 1, iajb_d, 0, 1, &iajb_term);
+                C_DDOT_CUBLAS(cublas_handle, navir2, ibja, 0, 1, iajb_d, 0, 1, &ibja_term);
+        
+                // accumulate os & ss on the CPU
+                double pair_prefactor = (i == j) ? 1.0 : 2.0;
+                e_os += pair_prefactor * iajb_term;
+                e_ss += pair_prefactor * (iajb_term - ibja_term);
+            }
+        }
+        // cuEST shares this handle and requires that cuBLAS emulation parameters should be reset prior to calling cuEST
+        CHECK_CUBLAS(cublasSetMathMode(cublas_handle, CUBLAS_DEFAULT_MATH));
     }
-    // cuEST shares this handle and requires that cuBLAS emulation parameters should be reset prior to calling cuEST
-    CHECK_CUBLAS(cublasSetMathMode(cublas_handle, CUBLAS_DEFAULT_MATH));
 
     cudaFree((void*) Bia_);
     cudaFree((void*) iajb);
