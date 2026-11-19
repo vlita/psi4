@@ -1217,14 +1217,27 @@ void RDFMP2::form_energy_cuest() {
     CHECK_CUDA(cudaMemcpy(deps_aocc, eps_aocc_->pointer(), sizeof(double) * naocc, cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(deps_avir, eps_avir_->pointer(), sizeof(double) * navir, cudaMemcpyHostToDevice));
 
+    // query memory
     size_t free, total;
     CHECK_CUDA(cudaMemGetInfo(&free, &total));
 
+    // size emulation workspace
     void* fp_emulation_ws = nullptr;
     size_t ws_size_bytes = static_cast<size_t>(8) * 1000 * 1000 * 1000;
+    
+    // query default emulation parameters
+    int prev_mantissa_bits;
+    cudaEmulationMantissaControl_t prev_mantissa_control;
+    
+    CHECK_CUBLAS(cublasGetFixedPointEmulationMaxMantissaBitCount(cublas_handle, &prev_mantissa_bits));
+    CHECK_CUBLAS(cublasGetFixedPointEmulationMantissaControl(cublas_handle, &prev_mantissa_control));
 
     if (options_.get_str("CUBLAS_MIXED_PRECISION") == "ENABLED") {
         CHECK_CUBLAS(cublasSetMathMode(cublas_handle, CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH));
+
+        CHECK_CUBLAS(cublasSetFixedPointEmulationMantissaControl(cublas_handle, CUDA_EMULATION_MANTISSA_CONTROL_FIXED));
+
+        CHECK_CUBLAS(cublasSetFixedPointEmulationMaxMantissaBitCount(cublas_handle, options_.get_int("CUBLAS_MANTISSA_COUNT")));
 
         outfile->Printf("    free GPU memory:       %8.3f GiB\n", free / (1024.0 * 1024.0 * 1024.0));
         outfile->Printf("    fixed-point emulation workspace:       %8.3f GiB temporary\n", ws_size_bytes / (1024.0 * 1024.0 * 1024.0));
@@ -1262,10 +1275,14 @@ void RDFMP2::form_energy_cuest() {
     }
 
     if (options_.get_str("CUBLAS_MIXED_PRECISION") == "ENABLED") {
-    	// reset workspace back to default
+    	// cuEST shares this handle and requires that the cuBLAS emulation workspace should be reset prior to calling cuEST
         CHECK_CUBLAS(cublasSetStream(cublas_handle, stream_handle));
-        
+
         // cuEST shares this handle and requires that cuBLAS emulation parameters should be reset prior to calling cuEST
+        CHECK_CUBLAS(cublasSetFixedPointEmulationMantissaControl(cublas_handle, prev_mantissa_control));
+        CHECK_CUBLAS(cublasSetFixedPointEmulationMaxMantissaBitCount(cublas_handle, prev_mantissa_bits));
+        
+        // cuEST shares this handle and requires that cuBLAS math mode should be reset prior to calling cuEST
         CHECK_CUBLAS(cublasSetMathMode(cublas_handle, CUBLAS_DEFAULT_MATH));
     }
     CHECK_CUDA(cudaFree(fp_emulation_ws));
