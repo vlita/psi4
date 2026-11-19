@@ -1227,7 +1227,6 @@ void RDFMP2::form_energy_cuest() {
         CHECK_CUBLAS(cublasSetMathMode(cublas_handle, CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH));
 
         outfile->Printf("    free GPU memory:       %8.3f GiB\n", free / (1024.0 * 1024.0 * 1024.0));
-
         outfile->Printf("    fixed-point emulation workspace:       %8.3f GiB temporary\n", ws_size_bytes / (1024.0 * 1024.0 * 1024.0));
 
         CHECK_CUDA(cudaMalloc((void**) &fp_emulation_ws, ws_size_bytes));
