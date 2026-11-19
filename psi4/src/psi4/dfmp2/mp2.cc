@@ -1216,14 +1216,19 @@ void RDFMP2::form_energy_cuest() {
     
     CHECK_CUDA(cudaMemcpy(deps_aocc, eps_aocc_->pointer(), sizeof(double) * naocc, cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(deps_avir, eps_avir_->pointer(), sizeof(double) * navir, cudaMemcpyHostToDevice));
- 
-    size_t ws_size_bytes = size_t(2) << 30;  // 2 GiB
+
+    size_t free, total;
+    CHECK_CUDA(cudaMemGetInfo(&free, &total));
+
     void* fp_emulation_ws = nullptr;
+    size_t ws_size_bytes = static_cast<size_t>(8) * 1000 * 1000 * 1000;
 
     if (options_.get_str("CUBLAS_MIXED_PRECISION") == "ENABLED") {
         CHECK_CUBLAS(cublasSetMathMode(cublas_handle, CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH));
 
-        outfile->Printf("allocating 2 GiB workspace for cuBLAS fixed-point emulation\n");
+        outfile->Printf("    free GPU memory:       %8.3f GiB\n", free / (1024.0 * 1024.0 * 1024.0));
+
+        outfile->Printf("    fixed-point emulation workspace:       %8.3f GiB temporary\n", ws_size_bytes / (1024.0 * 1024.0 * 1024.0));
 
         CHECK_CUDA(cudaMalloc((void**) &fp_emulation_ws, ws_size_bytes));
         CHECK_CUBLAS(cublasSetWorkspace(cublas_handle, fp_emulation_ws, ws_size_bytes));
