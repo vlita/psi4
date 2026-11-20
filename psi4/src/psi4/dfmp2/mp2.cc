@@ -1225,18 +1225,22 @@ void RDFMP2::form_energy_cuest() {
     void* fp_emulation_ws = nullptr;
     size_t ws_size_bytes = static_cast<size_t>(8) * 1000 * 1000 * 1000;
     
-    // query default emulation parameters
-    int prev_mantissa_bits;
-    cudaEmulationMantissaControl_t prev_mantissa_control;
-    
-    CHECK_CUBLAS(cublasGetFixedPointEmulationMaxMantissaBitCount(cublas_handle, &prev_mantissa_bits));
-    CHECK_CUBLAS(cublasGetFixedPointEmulationMantissaControl(cublas_handle, &prev_mantissa_control));
+    // query default cublas handle parameters
+    cublasMath_t default_mode;
+    cublasEmulationStrategy_t default_strategy;
+    cudaEmulationMantissaControl_t default_mantissa_control;
+    int default_mantissa_bits;
+
+    CHECK_CUBLAS(cublasGetMathMode(cublas_handle, &default_mode));
+    CHECK_CUBLAS(cublasGetEmulationStrategy(cublas_handle, &default_strategy));
+    CHECK_CUBLAS(cublasGetFixedPointEmulationMantissaControl(cublas_handle, &default_mantissa_control));
+    CHECK_CUBLAS(cublasGetFixedPointEmulationMaxMantissaBitCount(cublas_handle, &default_mantissa_bits));
 
     if (options_.get_str("CUBLAS_MIXED_PRECISION") == "ENABLED") {
+
         CHECK_CUBLAS(cublasSetMathMode(cublas_handle, CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH));
-
+        CHECK_CUBLAS(cublasSetEmulationStrategy(cublas_handle, CUBLAS_EMULATION_STRATEGY_EAGER));
         CHECK_CUBLAS(cublasSetFixedPointEmulationMantissaControl(cublas_handle, CUDA_EMULATION_MANTISSA_CONTROL_FIXED));
-
         CHECK_CUBLAS(cublasSetFixedPointEmulationMaxMantissaBitCount(cublas_handle, options_.get_int("CUBLAS_MANTISSA_COUNT")));
 
         outfile->Printf("    free GPU memory:       %8.3f GiB\n", free / (1024.0 * 1024.0 * 1024.0));
@@ -1275,16 +1279,15 @@ void RDFMP2::form_energy_cuest() {
     }
 
     if (options_.get_str("CUBLAS_MIXED_PRECISION") == "ENABLED") {
-    	// cuEST shares this handle and requires that the cuBLAS emulation workspace should be reset prior to calling cuEST
-        CHECK_CUBLAS(cublasSetStream(cublas_handle, stream_handle));
-
+    	
         // cuEST shares this handle and requires that cuBLAS emulation parameters should be reset prior to calling cuEST
-        CHECK_CUBLAS(cublasSetFixedPointEmulationMantissaControl(cublas_handle, prev_mantissa_control));
-        CHECK_CUBLAS(cublasSetFixedPointEmulationMaxMantissaBitCount(cublas_handle, prev_mantissa_bits));
-        
-        // cuEST shares this handle and requires that cuBLAS math mode should be reset prior to calling cuEST
-        CHECK_CUBLAS(cublasSetMathMode(cublas_handle, CUBLAS_DEFAULT_MATH));
+        CHECK_CUBLAS(cublasSetStream(cublas_handle, stream_handle));
+        CHECK_CUBLAS(cublasSetFixedPointEmulationMaxMantissaBitCount(cublas_handle, default_mantissa_bits));
+        CHECK_CUBLAS(cublasSetFixedPointEmulationMantissaControl(cublas_handle, default_mantissa_control));
+        CHECK_CUBLAS(cublasSetEmulationStrategy(cublas_handle, default_strategy));
+        CHECK_CUBLAS(cublasSetMathMode(cublas_handle, default_mode));
     }
+    
     CHECK_CUDA(cudaFree(fp_emulation_ws));
     
     CHECK_CUDA(cudaFree((void*) Bia_));
