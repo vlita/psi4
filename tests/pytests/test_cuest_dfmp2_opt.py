@@ -87,6 +87,12 @@ def test_cuest_dfmp2_opt_water(cpu_minimum, start):
     e_ref, (r1_ref, r2_ref, a_ref) = cpu_minimum
     e_gpu, (r1, r2, a) = _optimize(use_cuest=True, start=start)
 
+    print(f"\n    {'':14s} {'r(O-H1) [A]':>14s} {'r(O-H2) [A]':>14s} {'angle [deg]':>14s} {'E [Eh]':>18s}")
+    print(f"    {'start':14s} {start[0]:14.6f} {start[1]:14.6f} {start[2]:14.4f} {'':>18s}")
+    print(f"    {'CPU minimum':14s} {r1_ref:14.6f} {r2_ref:14.6f} {a_ref:14.4f} {e_ref:18.10f}")
+    print(f"    {'cuEST final':14s} {r1:14.6f} {r2:14.6f} {a:14.4f} {e_gpu:18.10f}")
+    print(f"    {'difference':14s} {r1 - r1_ref:14.2e} {r2 - r2_ref:14.2e} {a - a_ref:14.2e} {e_gpu - e_ref:18.2e}")
+
     # Sanity: the reference minimum is symmetric and the start really was off it.
     assert compare_values(r1_ref, r2_ref, _ATOL_R, "CPU minimum: r(O-H1) == r(O-H2)")
     assert max(abs(start[0] - r1_ref), abs(start[1] - r2_ref), abs(start[2] - a_ref) / 100.0) > 1e-2
