@@ -57,8 +57,12 @@
 #include "corr_grad.h"
 
 #ifdef USING_cuEST
+#include <cmath>
+#include <memory>
+
 #include <cuest.h>
 #include <cublas_v2.h>
+#include <cusolverDn.h>
 
 #include "mp2_kernels.h"
 #include "psi4/lib3index/cuESTMOInts.h"
@@ -68,6 +72,7 @@
 extern cudaStream_t stream_handle;
 extern cuestHandle_t cuest_handle;
 extern cublasHandle_t cublas_handle;
+extern cusolverDnHandle_t cusolver_handle;
 #endif
 
 namespace psi {
@@ -1275,6 +1280,917 @@ void RDFMP2::form_energy_cuest() {
 
     variables_["MP2 SAME-SPIN CORRELATION ENERGY"] = e_ss;
     variables_["MP2 OPPOSITE-SPIN CORRELATION ENERGY"] = e_os;
+}
+// => cuEST gradient <= //
+//
+// Analytic DF-MP2 nuclear gradient, adapted from the CUDALibrarySamples mp2-grad-1 example. Equation numbers
+// refer to the closed-shell expressions of Aikens et al., Theor Chem Acc 110, 233 (2003); doi:10.1007/s00214-003-0453-3.
+// As in the example, the occupied indices are looped over one at a time so the ijab tensors are never stored.
+//
+// Orbitals are indexed [frozen occ | active occ | active vir | frozen vir], so occupied orbitals start at 0,
+// virtuals at nocc, and the active virtuals are the first navir virtuals. The correlation quantities are fitted in
+// DF_BASIS_MP2 and the separable (reference + orbital relaxation) quantities in DF_BASIS_SCF, and the two fitting
+// bases are never resident on the device at the same time.
+//
+// All device matrices are row-major.
+
+namespace {
+
+double* allocate_device(size_t count) {
+    double* buffer = nullptr;
+    CHECK_CUDA(cudaMalloc((void**) &buffer, sizeof(double) * count));
+    return buffer;
+}
+
+double* allocate_device_zeros(size_t count) {
+    double* buffer = allocate_device(count);
+    CHECK_CUDA(cudaMemset(buffer, 0, sizeof(double) * count));
+    return buffer;
+}
+
+// out = alpha (in + in^T) for a square matrix; out must not alias in
+void symmetrize(int n, double alpha, const double* in, double* out) {
+    C_DGEAM_CUBLAS(cublas_handle, false, true, n, n, alpha, in, n, alpha, in, n, out, n);
+}
+
+// out [ncols, nrows] = in^T for in [nrows, ncols]; out must not alias in
+void transpose(int nrows, int ncols, const double* in, double* out) {
+    // cuBLAS is column-major, so in looks like [ncols, nrows] to it and out like [nrows, ncols]
+    C_DGEAM_CUBLAS(cublas_handle, true, false, nrows, ncols, 1.0, in, ncols, 0.0, nullptr, nrows, out, nrows);
+}
+
+// out = C^T M C, taking an [nmo, nmo] MO-basis matrix to the AO basis; C is [nmo, nao]
+void mo_to_ao(int nmo, int nao, const double* C, const double* M, double* out) {
+    double* scratch = allocate_device((size_t)nao * nmo);
+    C_DGEMM_CUBLAS(cublas_handle, true, false, nao, nmo, nmo, 1.0, C, 0, nao, M, 0, nmo, 0.0, scratch, nmo);
+    C_DGEMM_CUBLAS(cublas_handle, false, false, nao, nao, nmo, 1.0, scratch, 0, nmo, C, 0, nao, 0.0, out, nao);
+    CHECK_CUDA(cudaFree(scratch));
+}
+
+SharedMatrix device_to_gradient(const double* d_G, int natom, const std::string& name) {
+    auto G = std::make_shared<Matrix>(name, natom, 3);
+    CHECK_CUDA(cudaMemcpy(G->pointer()[0], d_G, sizeof(double) * natom * 3, cudaMemcpyDeviceToHost));
+    return G;
+}
+
+}  // namespace
+
+SharedMatrix RDFMP2::compute_gradient() {
+    if (!use_cuest_) return DFMP2::compute_gradient();
+
+    print_header();
+
+    if (Caocc_->colspi()[0] == 0) {
+        throw PSIEXCEPTION("There are no active occupied orbitals.");
+    }
+    if (Cavir_->colspi()[0] == 0) {
+        throw PSIEXCEPTION("There are no active virtual orbitals.");
+    }
+    if (basisset_->has_ECP()) {
+        throw PSIEXCEPTION("DFMP2: ECPs are not yet supported by the cuEST gradient.");
+    }
+    if (external_pot_ || perturb_h_) {
+        throw PSIEXCEPTION("DFMP2: External potentials and perturbations are not supported by the cuEST gradient.");
+    }
+
+    timer_on("DFMP2 cuEST grad");
+    form_gradient_cuest();
+    timer_off("DFMP2 cuEST grad");
+
+    print_energies();
+    energy_ = variables_["MP2 TOTAL ENERGY"];
+
+    if (options_.get_bool("ONEPDM")) {
+        return std::make_shared<Matrix>("nullptr", 0, 0);
+    }
+
+    // Symmetrize the gradient to remove noise
+    gradients_["Total"]->symmetrize_gradient(molecule_);
+
+    print_gradients();
+
+    return gradients_["Total"];
+}
+void RDFMP2::form_gradient_cuest() {
+    // => Sizing <= //
+
+    int nfocc = Cfocc_->colspi()[0];
+    int naocc = Caocc_->colspi()[0];
+    int navir = Cavir_->colspi()[0];
+    int nfvir = Cfvir_->colspi()[0];
+    int nocc = nfocc + naocc;
+    int nvir = navir + nfvir;
+    int nmo = nocc + nvir;
+    int nao = basisset_->nbf();
+    int natom = molecule_->natom();
+
+    auto jkbasis = get_basisset("DF_BASIS_SCF");
+    size_t naux_ri = ribasis_->nbf();
+    size_t naux_jk = jkbasis->nbf();
+
+    cuest_common::print_memory_header();
+
+    // => MO coefficients and orbital energies <= //
+
+    // cuEST needs C as [nmo, nao]
+    auto CT = std::make_shared<Matrix>("C^T", nmo, nao);
+    auto eps = std::make_shared<Vector>("eps", nmo);
+    std::vector<std::pair<SharedMatrix, SharedVector>> spaces = {
+        {Cfocc_, eps_focc_}, {Caocc_, eps_aocc_}, {Cavir_, eps_avir_}, {Cfvir_, eps_fvir_}};
+    int p = 0;
+    for (const auto& space : spaces) {
+        for (int q = 0; q < space.first->colspi()[0]; q++, p++) {
+            for (int m = 0; m < nao; m++) {
+                CT->set(p, m, space.first->get(m, q));
+            }
+            eps->set(p, space.second->get(q));
+        }
+    }
+
+    cuest_common::print_memory_row("MO coefficients", sizeof(double) * ((size_t)nmo * nao + nmo), 0);
+
+    double* d_C = allocate_device((size_t)nmo * nao);
+    double* d_eps = allocate_device(nmo);
+    CHECK_CUDA(cudaMemcpy(d_C, CT->pointer()[0], sizeof(double) * nmo * nao, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_eps, eps->pointer(), sizeof(double) * nmo, cudaMemcpyHostToDevice));
+
+    const double* d_Cocc = d_C;
+    const double* d_Cvir = d_C + (size_t)nocc * nao;
+
+    // => Fitted MO integrals in the RI basis <= //
+
+    // The occ-occ, occ-vir and vir-vir blocks go in as one batched transform so the AO three-center integrals are
+    // traversed once, and come back packed back to back. The ov and vv blocks span all virtuals, frozen ones
+    // included: the amplitudes only use the active virtuals, but the Lagrangian needs the rest (Aikens 159, 182).
+    timer_on("DFMP2 cuEST MO Ints");
+
+    auto mo_ints_ri = std::make_unique<cuESTMOInts>(basisset_, ribasis_, options_);
+
+    size_t B_ri_size = naux_ri * ((size_t)nocc * nocc + (size_t)nocc * nvir + (size_t)nvir * nvir);
+    cuest_common::print_memory_row("B (RI)", sizeof(double) * B_ri_size,
+                                   sizeof(double) * (size_t)(3 * nocc + 3 * nvir) * nao);
+
+    double* B_ri = allocate_device(B_ri_size);
+    double* C_left = allocate_device((size_t)(2 * nocc + nvir) * nao);
+    double* C_right = allocate_device((size_t)(nocc + 2 * nvir) * nao);
+
+    // C_left = [C_occ; C_occ; C_vir], C_right = [C_occ; C_vir; C_vir]
+    size_t occ_bytes = sizeof(double) * nocc * nao;
+    size_t vir_bytes = sizeof(double) * nvir * nao;
+    CHECK_CUDA(cudaMemcpy(C_left, d_Cocc, occ_bytes, cudaMemcpyDeviceToDevice));
+    CHECK_CUDA(cudaMemcpy(C_left + (size_t)nocc * nao, d_Cocc, occ_bytes, cudaMemcpyDeviceToDevice));
+    CHECK_CUDA(cudaMemcpy(C_left + (size_t)2 * nocc * nao, d_Cvir, vir_bytes, cudaMemcpyDeviceToDevice));
+    CHECK_CUDA(cudaMemcpy(C_right, d_Cocc, occ_bytes, cudaMemcpyDeviceToDevice));
+    CHECK_CUDA(cudaMemcpy(C_right + (size_t)nocc * nao, d_Cvir, vir_bytes, cudaMemcpyDeviceToDevice));
+    CHECK_CUDA(cudaMemcpy(C_right + (size_t)(nocc + nvir) * nao, d_Cvir, vir_bytes, cudaMemcpyDeviceToDevice));
+
+    mo_ints_ri->compute_3c_ints({(uint64_t)nocc, (uint64_t)nocc, (uint64_t)nvir},
+                                {(uint64_t)nocc, (uint64_t)nvir, (uint64_t)nvir}, C_left, C_right, B_ri);
+
+    CHECK_CUDA(cudaFree(C_left));
+    CHECK_CUDA(cudaFree(C_right));
+
+    const double* B_oo = B_ri;
+    const double* B_ov = B_oo + naux_ri * nocc * nocc;
+    const double* B_vv = B_ov + naux_ri * nocc * nvir;
+
+    timer_off("DFMP2 cuEST MO Ints");
+
+    // => Amplitudes and the correlation density <= //
+
+    timer_on("DFMP2 cuEST Amplitudes");
+
+    cuest_common::print_memory_row("gamma3 (RI)", sizeof(double) * naux_ri * naocc * navir, 0);
+
+    double* P_ij = allocate_device_zeros((size_t)naocc * naocc);
+    double* P_ab = allocate_device_zeros((size_t)navir * navir);
+    double* gamma3_ri = allocate_device_zeros(naux_ri * naocc * navir);
+
+    form_correlation_intermediates_cuest(B_ov, d_eps, P_ij, P_ab, gamma3_ri);
+
+    timer_off("DFMP2 cuEST Amplitudes");
+
+    timer_on("DFMP2 cuEST Lagrangian");
+
+    double* W_I_ij = allocate_device_zeros((size_t)nocc * nocc);
+    double* W_I_ab = allocate_device_zeros((size_t)nvir * nvir);
+    double* half_L_ai_NS = allocate_device_zeros((size_t)nvir * nocc);
+    double* half_W_I_ai = allocate_device_zeros((size_t)nvir * nocc);
+
+    form_lagrangian_cuest(B_oo, B_ov, B_vv, gamma3_ri, W_I_ij, W_I_ab, half_L_ai_NS, half_W_I_ai);
+
+    timer_off("DFMP2 cuEST Lagrangian");
+
+    // => Non-separable derivative, taken early so the RI side can be released <= //
+
+    // B_ri's last reader was form_lagrangian_cuest, and gamma3 was final the moment the amplitudes were.
+    // The non-separable TPDM lives entirely in the active occ-vir block. B_ia and B_ai are the same integrals,
+    // so a single (ov) term with the TPDM doubled contributes what contracting both orderings would.
+    timer_on("DFMP2 cuEST MO Deriv Ints");
+
+    CHECK_CUDA(cudaFree(B_ri));
+
+    // gamma3 is not needed after this contraction, so it is doubled in place
+    C_DSCAL_CUBLAS(cublas_handle, naux_ri * naocc * navir, 2.0, gamma3_ri, 1);
+
+    double* G_ri = allocate_device((size_t)natom * 3);
+
+    // eq. (171)
+    mo_ints_ri->compute_3c_derivative({(uint64_t)naocc}, {(uint64_t)navir}, d_C + (size_t)nfocc * nao, d_Cvir,
+                                      gamma3_ri, G_ri);
+
+    CHECK_CUDA(cudaFree(gamma3_ri));
+    mo_ints_ri.reset();
+
+    timer_off("DFMP2 cuEST MO Deriv Ints");
+
+    // => Orbital relaxation <= //
+
+    timer_on("DFMP2 cuEST Lagrangian");
+
+    double* P_unrelaxed = allocate_device_zeros((size_t)nmo * nmo);
+    double* scratch_mo = allocate_device((size_t)nmo * nmo);
+
+    // eq. (177)
+    symmetrize(naocc, 1.0, P_ij, scratch_mo);
+    scatter_block(naocc, naocc, nmo, 1.0, scratch_mo, P_unrelaxed + (size_t)nfocc * nmo + nfocc, stream_handle);
+    // eq. (178)
+    symmetrize(navir, 1.0, P_ab, scratch_mo);
+    scatter_block(navir, navir, nmo, 1.0, scratch_mo, P_unrelaxed + (size_t)nocc * nmo + nocc, stream_handle);
+
+    CHECK_CUDA(cudaFree(P_ij));
+    CHECK_CUDA(cudaFree(P_ab));
+
+    // Write a small host block into P_unrelaxed at (row, col), and its transpose at (col, row)
+    auto scatter_host_block = [&](SharedMatrix block, int row, int col) {
+        int nrows = block->rowspi()[0];
+        int ncols = block->colspi()[0];
+        double* d_block = allocate_device((size_t)nrows * ncols);
+        CHECK_CUDA(cudaMemcpy(d_block, block->pointer()[0], sizeof(double) * nrows * ncols, cudaMemcpyHostToDevice));
+        scatter_block(nrows, ncols, nmo, 1.0, d_block, P_unrelaxed + (size_t)row * nmo + col, stream_handle);
+        transpose(nrows, ncols, d_block, scratch_mo);
+        scatter_block(ncols, nrows, nmo, 1.0, scratch_mo, P_unrelaxed + (size_t)col * nmo + row, stream_handle);
+        CHECK_CUDA(cudaFree(d_block));
+    };
+
+    if (nfocc) {
+        // Core-active block, P_Ki = 2 / (eps_i - eps_K) sum_jab T_ij^ab (Ka|jb).
+        // The sum is the K row of -W_I_ij (eq. 181), so no iteration is needed.
+        auto W_I_ij_h = std::make_shared<Matrix>("W_I_ij", nocc, nocc);
+        CHECK_CUDA(cudaMemcpy(W_I_ij_h->pointer()[0], W_I_ij, sizeof(double) * nocc * nocc, cudaMemcpyDeviceToHost));
+
+        // eq. (176)
+        auto P_Ki = std::make_shared<Matrix>("P_Ki", nfocc, naocc);
+        for (int K = 0; K < nfocc; K++) {
+            for (int i = 0; i < naocc; i++) {
+                P_Ki->set(K, i, -W_I_ij_h->get(K, nfocc + i) / (eps->get(nfocc + i) - eps->get(K)));
+            }
+        }
+        scatter_host_block(P_Ki, 0, nfocc);
+    }
+
+    if (nfvir) {
+        // Frozen virtual-active block, P_Ca = 2 / (eps_a - eps_C) sum_ijb T_ij^ab (iC|jb).
+        // The sum is the C row of -W_I_ab (eq. 182, whose b runs over all virtuals), so no iteration is needed.
+        auto W_I_ab_h = std::make_shared<Matrix>("W_I_ab", nvir, nvir);
+        CHECK_CUDA(cudaMemcpy(W_I_ab_h->pointer()[0], W_I_ab, sizeof(double) * nvir * nvir, cudaMemcpyDeviceToHost));
+
+        // eq. (179)
+        auto P_Ca = std::make_shared<Matrix>("P_Ca", nfvir, navir);
+        for (int C = 0; C < nfvir; C++) {
+            for (int a = 0; a < navir; a++) {
+                P_Ca->set(C, a, -W_I_ab_h->get(navir + C, a) / (eps->get(nocc + a) - eps->get(nocc + navir + C)));
+            }
+        }
+        scatter_host_block(P_Ca, nocc + navir, nocc);
+    }
+
+    // Only the OPDM was requested, and it should not be relaxed
+    if (options_.get_bool("ONEPDM") && !options_.get_bool("OPDM_RELAX")) {
+        store_opdm_cuest(P_unrelaxed, false);
+
+        CHECK_CUDA(cudaFree(d_C));
+        CHECK_CUDA(cudaFree(d_eps));
+        CHECK_CUDA(cudaFree(G_ri));
+        CHECK_CUDA(cudaFree(W_I_ij));
+        CHECK_CUDA(cudaFree(W_I_ab));
+        CHECK_CUDA(cudaFree(half_L_ai_NS));
+        CHECK_CUDA(cudaFree(half_W_I_ai));
+        CHECK_CUDA(cudaFree(P_unrelaxed));
+        CHECK_CUDA(cudaFree(scratch_mo));
+        timer_off("DFMP2 cuEST Lagrangian");
+        return;
+    }
+
+    // From here on, the J/K builds and the separable TPDM use the SCF's own fitting basis
+    auto mo_ints_jk = std::make_unique<cuESTMOInts>(basisset_, jkbasis, options_);
+
+    double* P_ao = allocate_device((size_t)nao * nao);
+    double* half_L_ai = allocate_device((size_t)nvir * nocc);
+
+    // eq. (159)
+    mo_to_ao(nmo, nao, d_C, P_unrelaxed, P_ao);
+    form_fock_response_cuest(*mo_ints_jk, d_C, P_ao, half_L_ai);
+    // eq. (159)
+    C_DAXPY_CUBLAS(cublas_handle, nvir * nocc, 1.0, half_L_ai_NS, 1, half_L_ai, 1);
+
+    CHECK_CUDA(cudaFree(half_L_ai_NS));
+
+    timer_off("DFMP2 cuEST Lagrangian");
+
+    // => Z-vector <= //
+
+    // The z-vector equations are A P_ai = -L_ai; half_L_ai is negated in place
+    timer_on("DFMP2 cuEST Z");
+
+    outfile->Printf("\n");
+
+    C_DSCAL_CUBLAS(cublas_handle, nvir * nocc, -1.0, half_L_ai, 1);
+    double* minus_half_L_ai = half_L_ai;
+
+    double* half_P_ai = allocate_device((size_t)nvir * nocc);
+
+    // eq. (163)
+    solve_z_vector_cuest(*mo_ints_jk, d_C, d_eps, minus_half_L_ai, half_P_ai);
+
+    CHECK_CUDA(cudaFree(minus_half_L_ai));
+
+    timer_off("DFMP2 cuEST Z");
+
+    // P_unrelaxed is not needed again, so the relaxed density is built in place
+    double* P_mo = P_unrelaxed;
+    // eq. (180)
+    scatter_block(nvir, nocc, nmo, 1.0, half_P_ai, P_mo + (size_t)nocc * nmo, stream_handle);
+    transpose(nvir, nocc, half_P_ai, scratch_mo);
+    // eq. (180)
+    scatter_block(nocc, nvir, nmo, 1.0, scratch_mo, P_mo + nocc, stream_handle);
+
+    CHECK_CUDA(cudaFree(half_P_ai));
+
+    store_opdm_cuest(P_mo, true);
+
+    if (options_.get_bool("ONEPDM")) {
+        // Shut everything down; only the OPDM was requested
+        CHECK_CUDA(cudaFree(d_C));
+        CHECK_CUDA(cudaFree(d_eps));
+        CHECK_CUDA(cudaFree(G_ri));
+        CHECK_CUDA(cudaFree(W_I_ij));
+        CHECK_CUDA(cudaFree(W_I_ab));
+        CHECK_CUDA(cudaFree(half_W_I_ai));
+        CHECK_CUDA(cudaFree(P_mo));
+        CHECK_CUDA(cudaFree(scratch_mo));
+        CHECK_CUDA(cudaFree(P_ao));
+        return;
+    }
+
+    // => Generalized Fock and energy-weighted densities <= //
+
+    timer_on("DFMP2 cuEST W");
+
+    double* W_I_mo = allocate_device_zeros((size_t)nmo * nmo);
+    // eq. (181)
+    scatter_block(nocc, nocc, nmo, 1.0, W_I_ij, W_I_mo, stream_handle);
+    // eq. (182)
+    scatter_block(nvir, nvir, nmo, 1.0, W_I_ab, W_I_mo + (size_t)nocc * nmo + nocc, stream_handle);
+    // eq. (183)
+    transpose(nvir, nocc, half_W_I_ai, scratch_mo);
+    scatter_block(nocc, nvir, nmo, 1.0, scratch_mo, W_I_mo + nocc, stream_handle);
+    // eq. (183)
+    scatter_block(nvir, nocc, nmo, 1.0, half_W_I_ai, W_I_mo + (size_t)nocc * nmo, stream_handle);
+
+    CHECK_CUDA(cudaFree(W_I_ij));
+    CHECK_CUDA(cudaFree(W_I_ab));
+    CHECK_CUDA(cudaFree(half_W_I_ai));
+
+    double* W_II_mo = allocate_device((size_t)nmo * nmo);
+    // eq. (184), (185), (186)
+    make_W(nmo, nocc, d_eps, P_mo, W_II_mo, stream_handle);
+    C_DSCAL_CUBLAS(cublas_handle, nmo * nmo, -1.0, W_II_mo, 1);
+
+    double* W_I_ao = allocate_device((size_t)nao * nao);
+    double* W_II_ao = allocate_device((size_t)nao * nao);
+    mo_to_ao(nmo, nao, d_C, W_I_mo, W_I_ao);
+    mo_to_ao(nmo, nao, d_C, W_II_mo, W_II_ao);
+    mo_to_ao(nmo, nao, d_C, P_mo, P_ao);
+
+    CHECK_CUDA(cudaFree(W_I_mo));
+    CHECK_CUDA(cudaFree(W_II_mo));
+
+    // p1 = C_occ^T C_occ
+    double* p1 = allocate_device((size_t)nao * nao);
+    C_DGEMM_CUBLAS(cublas_handle, true, false, nao, nao, nocc, 1.0, d_Cocc, 0, nao, d_Cocc, 0, nao, 0.0, p1, nao);
+
+    // The reference energy-weighted density, W_hf = C_occ^T diag(eps_occ) C_occ
+    double* W_hf = allocate_device((size_t)nao * nao);
+    double* C_occ_scaled = allocate_device((size_t)nocc * nao);
+    CHECK_CUDA(cudaMemcpy(C_occ_scaled, d_Cocc, occ_bytes, cudaMemcpyDeviceToDevice));
+    scale_rows(nocc, nao, d_eps, C_occ_scaled, stream_handle);
+    C_DGEMM_CUBLAS(cublas_handle, true, false, nao, nao, nocc, 1.0, d_Cocc, 0, nao, C_occ_scaled, 0, nao, 0.0, W_hf, nao);
+
+    CHECK_CUDA(cudaFree(C_occ_scaled));
+
+    // W_III = -p1 veff(2 P_ao) p1
+    double* P_ao_sym = allocate_device((size_t)nao * nao);
+    double* veff = allocate_device((size_t)nao * nao);
+    double* scratch_ao = allocate_device((size_t)nao * nao);
+    double* W_III_ao = allocate_device((size_t)nao * nao);
+
+    symmetrize(nao, 1.0, P_ao, P_ao_sym);
+    form_veff_cuest(*mo_ints_jk, P_ao_sym, veff);
+    C_DGEMM_CUBLAS(cublas_handle, false, false, nao, nao, nao, 1.0, p1, 0, nao, veff, 0, nao, 0.0, scratch_ao, nao);
+    // eq. (187)
+    C_DGEMM_CUBLAS(cublas_handle, false, false, nao, nao, nao, -1.0, scratch_ao, 0, nao, p1, 0, nao, 0.0, W_III_ao, nao);
+
+    CHECK_CUDA(cudaFree(P_ao_sym));
+    CHECK_CUDA(cudaFree(veff));
+
+    timer_off("DFMP2 cuEST W");
+
+    // => Two-electron TPDM: reference plus the relaxed-density correction <= //
+
+    timer_on("DFMP2 cuEST MO Ints");
+
+    cuest_common::print_memory_header();
+    cuest_common::print_memory_row("B (JK)", sizeof(double) * naux_jk * nmo * nmo, 0);
+
+    double* B_jk = allocate_device(naux_jk * nmo * nmo);
+    mo_ints_jk->compute_3c_ints({(uint64_t)nmo}, {(uint64_t)nmo}, d_C, d_C, B_jk);
+
+    timer_off("DFMP2 cuEST MO Ints");
+
+    timer_on("DFMP2 cuEST Gamma3");
+
+    double* P_hf_mo = allocate_device_zeros((size_t)nmo * nmo);
+    set_diagonal(nocc, nmo, 2.0, P_hf_mo, stream_handle);
+
+    double* P_total_mo = allocate_device((size_t)nmo * nmo);
+    C_DCOPY_CUBLAS(cublas_handle, nmo * nmo, P_mo, 1, P_total_mo, 1);
+    C_DAXPY_CUBLAS(cublas_handle, nmo * nmo, 0.5, P_hf_mo, 1, P_total_mo, 1);
+
+    // eq. (174); B_jk is overwritten with gamma3
+    form_gamma3_separable_cuest(B_jk, P_total_mo, P_hf_mo, naux_jk);
+    double* gamma3_jk = B_jk;
+
+    CHECK_CUDA(cudaFree(P_hf_mo));
+    CHECK_CUDA(cudaFree(P_total_mo));
+    CHECK_CUDA(cudaFree(P_mo));
+    CHECK_CUDA(cudaFree(scratch_mo));
+
+    timer_off("DFMP2 cuEST Gamma3");
+
+    // => Contract every piece with the derivative integrals <= //
+
+    timer_on("DFMP2 cuEST MO Deriv Ints");
+
+    double* G_jk = allocate_device((size_t)natom * 3);
+    // eq. (174)
+    mo_ints_jk->compute_3c_derivative({(uint64_t)nmo}, {(uint64_t)nmo}, d_C, d_C, gamma3_jk, G_jk);
+
+    CHECK_CUDA(cudaFree(gamma3_jk));
+
+    timer_off("DFMP2 cuEST MO Deriv Ints");
+
+    timer_on("DFMP2 cuEST 1e Deriv Ints");
+
+    // D_total = P + 2 C_occ^T C_occ
+    double* D_total_ao = P_ao;
+    C_DAXPY_CUBLAS(cublas_handle, nao * nao, 2.0, p1, 1, D_total_ao, 1);
+
+    double* G_T = allocate_device((size_t)natom * 3);
+    // eq. (24)
+    mo_ints_jk->compute_kinetic_derivative(D_total_ao, G_T);
+
+    // The potential is that of the nuclei, which cuEST wants as negated point charges
+    auto Z = std::make_shared<Vector>("-Z", natom);
+    for (int A = 0; A < natom; A++) {
+        Z->set(A, -molecule_->Z(A));
+    }
+    Matrix xyz = molecule_->geometry();
+
+    double* d_xyz = allocate_device((size_t)natom * 3);
+    double* d_Z = allocate_device(natom);
+    CHECK_CUDA(cudaMemcpy(d_xyz, xyz.pointer()[0], sizeof(double) * natom * 3, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_Z, Z->pointer(), sizeof(double) * natom, cudaMemcpyHostToDevice));
+
+    // The basis and charge derivatives come back separately and are simply summed
+    double* G_V_basis = allocate_device((size_t)natom * 3);
+    double* G_V_charge = allocate_device((size_t)natom * 3);
+    // eq. (24)
+    mo_ints_jk->compute_potential_derivative(natom, d_xyz, d_Z, D_total_ao, G_V_basis, G_V_charge);
+
+    CHECK_CUDA(cudaFree(d_xyz));
+    CHECK_CUDA(cudaFree(d_Z));
+
+    // W = W_I + W_II - 2 W_hf + W_III
+    double* W_ao = W_I_ao;
+    C_DAXPY_CUBLAS(cublas_handle, nao * nao, 1.0, W_II_ao, 1, W_ao, 1);
+    C_DAXPY_CUBLAS(cublas_handle, nao * nao, -2.0, W_hf, 1, W_ao, 1);
+    C_DAXPY_CUBLAS(cublas_handle, nao * nao, 1.0, W_III_ao, 1, W_ao, 1);
+    symmetrize(nao, 0.5, W_ao, scratch_ao);
+
+    double* G_S = allocate_device((size_t)natom * 3);
+    // eq. (24)
+    mo_ints_jk->compute_overlap_derivative(scratch_ao, G_S);
+    outfile->Printf("\n");
+
+    timer_off("DFMP2 cuEST 1e Deriv Ints");
+
+    // => Gradient terms <= //
+
+    std::vector<std::string> gradient_terms = {"Nuclear", "Core", "Overlap", "Coulomb", "Correlation"};
+
+    gradients_["Nuclear"] = SharedMatrix(molecule_->nuclear_repulsion_energy_deriv1(dipole_field_strength_).clone());
+    gradients_["Nuclear"]->set_name("Nuclear Gradient");
+
+    gradients_["Core"] = device_to_gradient(G_T, natom, "Core Gradient");
+    gradients_["Core"]->add(device_to_gradient(G_V_basis, natom, "V basis"));
+    gradients_["Core"]->add(device_to_gradient(G_V_charge, natom, "V charge"));
+
+    gradients_["Overlap"] = device_to_gradient(G_S, natom, "Overlap Gradient");
+
+    // As in cuESTJKGrad, the JK-fitted Coulomb and exchange gradients come back as one term
+    gradients_["Coulomb"] = device_to_gradient(G_jk, natom, "Coulomb Gradient");
+
+    gradients_["Correlation"] = device_to_gradient(G_ri, natom, "Correlation Gradient");
+
+    auto total = std::make_shared<Matrix>("Total Gradient", natom, 3);
+    for (const auto& term : gradient_terms) {
+        total->add(gradients_[term]);
+    }
+    gradients_["Total"] = total;
+
+    // => Finalize <= //
+
+    CHECK_CUDA(cudaFree(d_C));
+    CHECK_CUDA(cudaFree(d_eps));
+    CHECK_CUDA(cudaFree(P_ao));
+    CHECK_CUDA(cudaFree(p1));
+    CHECK_CUDA(cudaFree(W_I_ao));
+    CHECK_CUDA(cudaFree(W_II_ao));
+    CHECK_CUDA(cudaFree(W_hf));
+    CHECK_CUDA(cudaFree(W_III_ao));
+    CHECK_CUDA(cudaFree(scratch_ao));
+    CHECK_CUDA(cudaFree(G_ri));
+    CHECK_CUDA(cudaFree(G_jk));
+    CHECK_CUDA(cudaFree(G_T));
+    CHECK_CUDA(cudaFree(G_V_basis));
+    CHECK_CUDA(cudaFree(G_V_charge));
+    CHECK_CUDA(cudaFree(G_S));
+}
+void RDFMP2::form_correlation_intermediates_cuest(const double* B_ov, const double* d_eps, double* P_ij, double* P_ab,
+                                                  double* gamma3) {
+    // Energy registers
+    double e_os = 0.0;
+    double e_total = 0.0;
+
+    // Sizing
+    int nfocc = Cfocc_->colspi()[0];
+    int naocc = Caocc_->colspi()[0];
+    int navir = Cavir_->colspi()[0];
+    int nfvir = Cfvir_->colspi()[0];
+    int nocc = nfocc + naocc;
+    int nvir = navir + nfvir;
+    int naux = ribasis_->nbf();
+
+    int navir2 = navir * navir;
+
+    // The amplitudes t and T = 2t - t' are o^2v^2, so only the naocc pair blocks sharing the current i are
+    // held, as an (naocc * navir, navir) buffer indexed [j, a, b]. i and j run over the active orbitals only,
+    // while B keeps its full layout, so its offsets use the absolute indices.
+    cuest_common::print_memory_row("amplitudes", 0, sizeof(double) * (2 * (size_t)naocc * navir2 + navir2));
+
+    double* t = allocate_device((size_t)naocc * navir2);
+    double* T = allocate_device((size_t)naocc * navir2);
+    double* iajb = allocate_device(navir2);
+
+    for (int i = nfocc; i < nocc; i++) {
+        for (int j = nfocc; j < nocc; j++) {
+            double* t_ij = t + (size_t)(j - nfocc) * navir2;
+            double* T_ij = T + (size_t)(j - nfocc) * navir2;
+
+            // eq. (144)
+            // For fixed i,j do (i a | j b) = sum_A B[A, i, a] * B[A, j, b], with a and b active
+            C_DGEMM_CUBLAS(cublas_handle, true, false, navir, navir, naux,
+                1.0, B_ov, i * nvir, nocc * nvir, B_ov, j * nvir, nocc * nvir, 0.0, iajb, navir);
+
+            // eq. (144)
+            // t_ij[a, b] = (i a | j b) / (eps[i] + eps[j] - eps[a] - eps[b])
+            pair_amplitudes_ij(i, j, navir, iajb, d_eps, d_eps + nocc, t_ij, stream_handle);
+            // T_ij[a, b] = 2 t_ij[a, b] - t_ij[b, a]
+            pair_tau(navir, t_ij, T_ij, stream_handle);
+
+            // eq. (1)
+            // E = sum_ijab (i a | j b) T_ij[a, b], of which sum_ijab (i a | j b) t_ij[a, b] is opposite-spin
+            double os_term = 0.0;
+            double total_term = 0.0;
+            C_DDOT_CUBLAS(cublas_handle, navir2, iajb, 0, 1, t_ij, 0, 1, &os_term);
+            C_DDOT_CUBLAS(cublas_handle, navir2, iajb, 0, 1, T_ij, 0, 1, &total_term);
+            e_os += os_term;
+            e_total += total_term;
+
+            // eq. (171)
+            // gamma3[A, i, a] = sum_jb B[A, j, b] T_ij[a, b]
+            C_DGEMM_CUBLAS(cublas_handle, false, true, naux, navir, navir,
+                1.0, B_ov, j * nvir, nocc * nvir, T_ij, 0, navir, 1.0, gamma3 + (i - nfocc) * navir, naocc * navir);
+        }
+
+        // eq. (177)
+        // P_jk -= sum_ab t_ij[a, b] T_ik[a, b], symmetrized later
+        C_DGEMM_CUBLAS(cublas_handle, false, true, naocc, naocc, navir2,
+            -1.0, t, 0, navir2, T, 0, navir2, 1.0, P_ij, naocc);
+        // eq. (178)
+        // P_ab += sum_jc t_ij[c, a] T_ij[c, b], symmetrized later
+        C_DGEMM_CUBLAS(cublas_handle, true, false, navir, navir, naocc * navir,
+            1.0, t, 0, navir, T, 0, navir, 1.0, P_ab, navir);
+    }
+
+    CHECK_CUDA(cudaFree(t));
+    CHECK_CUDA(cudaFree(T));
+    CHECK_CUDA(cudaFree(iajb));
+
+    variables_["MP2 SAME-SPIN CORRELATION ENERGY"] = e_total - e_os;
+    variables_["MP2 OPPOSITE-SPIN CORRELATION ENERGY"] = e_os;
+}
+void RDFMP2::form_lagrangian_cuest(const double* B_oo, const double* B_ov, const double* B_vv, const double* gamma3,
+                                   double* W_I_ij, double* W_I_ab, double* half_L_ai_NS, double* half_W_I_ai) {
+    // Every piece here is a contraction of two fitted quantities, because the amplitudes enter only through gamma3:
+    //     W_I_ij[p,k] = -2 sum_Aa B[A,p,a] gamma3[A,k,a]
+    //     W_I_ab[c,b] = -2 sum_Ai B[A,i,c] gamma3[A,i,b]
+    // which avoids ever touching the o^2v^2 amplitudes again.
+    //
+    // gamma3 holds active occupied and active virtual indices only. The other index of each contraction runs over
+    // its whole space: all occupied for W_I_ij and half_W_I_ai, all virtuals for W_I_ab and the (159) term. The
+    // frozen rows of W_I_ij and W_I_ab are what give the frozen-core and frozen-virtual densities (176, 179).
+    // The outputs are full-sized, with the blocks gamma3 cannot reach left at zero.
+
+    // Sizing
+    int nfocc = Cfocc_->colspi()[0];
+    int naocc = Caocc_->colspi()[0];
+    int navir = Cavir_->colspi()[0];
+    int nfvir = Cfvir_->colspi()[0];
+    int nocc = nfocc + naocc;
+    int nvir = navir + nfvir;
+    size_t naux = ribasis_->nbf();
+
+    for (size_t A = 0; A < naux; A++) {
+        const double* B_oo_A = B_oo + A * nocc * nocc;
+        const double* B_ov_A = B_ov + A * nocc * nvir;
+        const double* B_vv_A = B_vv + A * nvir * nvir;
+        const double* gamma3_A = gamma3 + A * naocc * navir;
+
+        // eq. (181)
+        // W_I_ij[p, k] += -2 sum_a B[A, p, a] gamma3[A, k, a], p occupied, k and a active
+        C_DGEMM_CUBLAS(cublas_handle, false, true, nocc, naocc, navir,
+            -2.0, B_ov_A, 0, nvir, gamma3_A, 0, navir, 1.0, W_I_ij + nfocc, nocc);
+        // eq. (159)
+        // half_L_ai[c, k] += 2 sum_b B[A, c, b] gamma3[A, k, b], c any virtual, k and b active
+        C_DGEMM_CUBLAS(cublas_handle, false, true, nvir, naocc, navir,
+            2.0, B_vv_A, 0, nvir, gamma3_A, 0, navir, 1.0, half_L_ai_NS + nfocc, nocc);
+        // eq. (183)
+        // half_W_I_ai[a, i] += -2 sum_k gamma3[A, k, a] B[A, k, i], i occupied, k and a active
+        C_DGEMM_CUBLAS(cublas_handle, true, false, navir, nocc, naocc,
+            -2.0, gamma3_A, 0, navir, B_oo_A, nfocc * nocc, nocc, 1.0, half_W_I_ai, nocc);
+        // eq. (182)
+        // W_I_ab[c, b] += -2 sum_i B[A, i, c] gamma3[A, i, b], c any virtual, i and b active
+        C_DGEMM_CUBLAS(cublas_handle, true, false, nvir, navir, naocc,
+            -2.0, B_ov_A, nfocc * nvir, nvir, gamma3_A, 0, navir, 1.0, W_I_ab, nvir);
+    }
+
+    // eq. (159)
+    C_DAXPY_CUBLAS(cublas_handle, nvir * nocc, 1.0, half_W_I_ai, 1, half_L_ai_NS, 1);
+}
+void RDFMP2::form_veff_cuest(cuESTMOInts& jk_ints, const double* P_ao, double* veff) {
+    int nao = basisset_->nbf();
+
+    double* P_sym = allocate_device((size_t)nao * nao);
+    symmetrize(nao, 0.5, P_ao, P_sym);
+
+    jk_ints.compute_J(P_sym, veff);
+
+    // The exchange build wants P = L^T R. Diagonalizing P_sym = V diag(lambda) V^T gives L = diag(lambda) V^T, R = V^T.
+    double* evals = allocate_device(nao);
+    int* info = nullptr;
+    CHECK_CUDA(cudaMalloc((void**) &info, sizeof(int)));
+
+    int lwork = 0;
+    if (cusolverDnDsyevd_bufferSize(cusolver_handle, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER, nao, P_sym,
+                                    nao, evals, &lwork) != CUSOLVER_STATUS_SUCCESS) {
+        throw PSIEXCEPTION("DFMP2: cusolverDnDsyevd_bufferSize failed.");
+    }
+    double* work = allocate_device(lwork);
+    if (cusolverDnDsyevd(cusolver_handle, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER, nao, P_sym, nao, evals,
+                         work, lwork, info) != CUSOLVER_STATUS_SUCCESS) {
+        throw PSIEXCEPTION("DFMP2: cusolverDnDsyevd failed.");
+    }
+    int info_h = 0;
+    CHECK_CUDA(cudaMemcpy(&info_h, info, sizeof(int), cudaMemcpyDeviceToHost));
+    if (info_h != 0) {
+        throw PSIEXCEPTION("DFMP2: cusolverDnDsyevd did not converge.");
+    }
+
+    // cuSOLVER leaves the eigenvectors as the columns of a column-major matrix, which read row-major is V^T
+    double* right = P_sym;
+    double* left = allocate_device((size_t)nao * nao);
+    CHECK_CUDA(cudaMemcpy(left, right, sizeof(double) * nao * nao, cudaMemcpyDeviceToDevice));
+    scale_rows(nao, nao, evals, left, stream_handle);
+
+    double* K = allocate_device((size_t)nao * nao);
+    jk_ints.compute_K_nonsymmetric(nao, left, right, K);
+
+    C_DAXPY_CUBLAS(cublas_handle, nao * nao, -0.5, K, 1, veff, 1);
+
+    CHECK_CUDA(cudaFree(P_sym));
+    CHECK_CUDA(cudaFree(evals));
+    CHECK_CUDA(cudaFree(info));
+    CHECK_CUDA(cudaFree(work));
+    CHECK_CUDA(cudaFree(left));
+    CHECK_CUDA(cudaFree(K));
+}
+void RDFMP2::form_fock_response_cuest(cuESTMOInts& jk_ints, const double* d_C, const double* P_ao, double* out) {
+    // This coupling appears both in the z-vector right-hand side and in every application of the orbital
+    // Hessian, differing only in the density it is formed from.
+    int nocc = Cfocc_->colspi()[0] + Caocc_->colspi()[0];
+    int nvir = Cavir_->colspi()[0] + Cfvir_->colspi()[0];
+    int nao = basisset_->nbf();
+
+    double* v = allocate_device((size_t)nao * nao);
+    double* scratch = allocate_device((size_t)nvir * nao);
+
+    // eq. (158)
+    form_veff_cuest(jk_ints, P_ao, v);
+    C_DGEMM_CUBLAS(cublas_handle, false, false, nvir, nao, nao,
+        1.0, d_C, nocc * nao, nao, v, 0, nao, 0.0, scratch, nao);
+    C_DGEMM_CUBLAS(cublas_handle, false, true, nvir, nocc, nao,
+        2.0, scratch, 0, nao, d_C, 0, nao, 0.0, out, nocc);
+
+    CHECK_CUDA(cudaFree(v));
+    CHECK_CUDA(cudaFree(scratch));
+}
+void RDFMP2::solve_z_vector_cuest(cuESTMOInts& jk_ints, const double* d_C, const double* d_eps,
+                                  const double* minus_L_ai, double* P_ai) {
+    // The orbital Hessian is applied as
+    //     (A P)_ai = (eps_a - eps_i) P_ai + [C_vir (4J - K - K^T) C_occ^T]_ai
+    // and every vector, including the CG bookkeeping, stays on the device.
+    int nocc = Cfocc_->colspi()[0] + Caocc_->colspi()[0];
+    int nvir = Cavir_->colspi()[0] + Cfvir_->colspi()[0];
+    int nao = basisset_->nbf();
+    int nvo = nvir * nocc;
+
+    double tolerance = options_.get_double("SOLVER_CONVERGENCE");
+    int maxiter = options_.get_int("SOLVER_MAXITER");
+
+    const double* eps_occ = d_eps;
+    const double* eps_vir = d_eps + nocc;
+
+    double* P_ao = allocate_device((size_t)nao * nao);
+    double* scratch = allocate_device((size_t)nao * nocc);
+
+    // eq. (163)
+    auto hessian_vector = [&](const double* x, double* out) {
+        // The response is wanted at the density P + P^T with P = C_vir^T x C_occ; veff averages its argument
+        // with its own transpose, so 2P is what gets passed into the Fock response.
+        C_DGEMM_CUBLAS(cublas_handle, true, false, nao, nocc, nvir,
+            1.0, d_C, nocc * nao, nao, x, 0, nocc, 0.0, scratch, nocc);
+        C_DGEMM_CUBLAS(cublas_handle, false, false, nao, nao, nocc,
+            2.0, scratch, 0, nocc, d_C, 0, nao, 0.0, P_ao, nao);
+        form_fock_response_cuest(jk_ints, d_C, P_ao, out);
+        apply_denominator(nvir, nocc, false, 1.0, 1.0, eps_occ, eps_vir, x, out, stream_handle);
+    };
+
+    auto precondition = [&](const double* x, double* y) {
+        apply_denominator(nvir, nocc, true, 1.0, 0.0, eps_occ, eps_vir, x, y, stream_handle);
+    };
+
+    double* r = allocate_device(nvo);
+    double* p = allocate_device(nvo);
+    double* zr = allocate_device(nvo);
+    double* Ap = allocate_device(nvo);
+
+    precondition(minus_L_ai, P_ai);
+    hessian_vector(P_ai, r);
+    C_DSCAL_CUBLAS(cublas_handle, nvo, -1.0, r, 1);
+    C_DAXPY_CUBLAS(cublas_handle, nvo, 1.0, minus_L_ai, 1, r, 1);
+    precondition(r, p);
+
+    double rz_old = 0.0;
+    C_DDOT_CUBLAS(cublas_handle, nvo, r, 0, 1, p, 0, 1, &rz_old);
+
+    outfile->Printf("  ==> Z-Vector Iterations (cuEST) <==\n\n");
+    outfile->Printf("    %-4s %12s\n", "Iter", "Residual");
+
+    bool converged = false;
+    for (int iteration = 1; iteration <= maxiter; iteration++) {
+        double r_norm = 0.0;
+        C_DDOT_CUBLAS(cublas_handle, nvo, r, 0, 1, r, 0, 1, &r_norm);
+        r_norm = std::sqrt(r_norm);
+        outfile->Printf("    %-4d %12.4e\n", iteration - 1, r_norm);
+        if (r_norm <= tolerance) {
+            converged = true;
+            break;
+        }
+
+        hessian_vector(p, Ap);
+
+        double pAp = 0.0;
+        C_DDOT_CUBLAS(cublas_handle, nvo, p, 0, 1, Ap, 0, 1, &pAp);
+        double alpha = rz_old / pAp;
+
+        C_DAXPY_CUBLAS(cublas_handle, nvo, alpha, p, 1, P_ai, 1);
+        C_DAXPY_CUBLAS(cublas_handle, nvo, -alpha, Ap, 1, r, 1);
+        precondition(r, zr);
+
+        double rz_new = 0.0;
+        C_DDOT_CUBLAS(cublas_handle, nvo, r, 0, 1, zr, 0, 1, &rz_new);
+
+        C_DSCAL_CUBLAS(cublas_handle, nvo, rz_new / rz_old, p, 1);
+        C_DAXPY_CUBLAS(cublas_handle, nvo, 1.0, zr, 1, p, 1);
+        rz_old = rz_new;
+    }
+    outfile->Printf("\n");
+
+    CHECK_CUDA(cudaFree(P_ao));
+    CHECK_CUDA(cudaFree(scratch));
+    CHECK_CUDA(cudaFree(r));
+    CHECK_CUDA(cudaFree(p));
+    CHECK_CUDA(cudaFree(zr));
+    CHECK_CUDA(cudaFree(Ap));
+
+    if (!converged) {
+        throw PSIEXCEPTION("DFMP2: cuEST z-vector iterations did not converge.");
+    }
+}
+void RDFMP2::form_gamma3_separable_cuest(double* B, const double* P1, const double* P2, size_t naux) {
+    // gamma3 = 1/2 dE/dB for the bilinear two-electron energy of densities P1 and P2,
+    //     E(P1,P2) = sum_A [ g1[A] g2[A] - 1/2 tr(P1 B[A] P2 B[A]) ],   g[A] = sum_pq P_pq B[A,pq]
+    //
+    // Written in place: B and gamma3 are the two largest tensors in the JK-fit basis and holding both would nearly
+    // double the memory requirements. The fitting charges read all of B, so they are formed first; after that block
+    // A depends only on B[A], so each block is assembled in a scratch buffer and written back once B[A] is spent.
+    int nmo = Cfocc_->colspi()[0] + Caocc_->colspi()[0] + Cavir_->colspi()[0] + Cfvir_->colspi()[0];
+    int nmo2 = nmo * nmo;
+
+    double* g1 = allocate_device(naux);
+    double* g2 = allocate_device(naux);
+    double* scratch = allocate_device(nmo2);
+    double* block = allocate_device(nmo2);
+
+    // eq. (174)
+    C_DGEMM_CUBLAS(cublas_handle, false, true, 1, naux, nmo2, 1.0, P1, 0, nmo2, B, 0, nmo2, 0.0, g1, naux);
+    // eq. (174)
+    C_DGEMM_CUBLAS(cublas_handle, false, true, 1, naux, nmo2, 1.0, P2, 0, nmo2, B, 0, nmo2, 0.0, g2, naux);
+
+    for (size_t A = 0; A < naux; A++) {
+        double* B_A = B + A * nmo2;
+
+        // eq. (174)
+        // exchange halves: block = -1/4 (P1 B[A] P2 + P2 B[A] P1)
+        C_DGEMM_CUBLAS(cublas_handle, false, false, nmo, nmo, nmo, 1.0, P1, 0, nmo, B_A, 0, nmo, 0.0, scratch, nmo);
+        C_DGEMM_CUBLAS(cublas_handle, false, false, nmo, nmo, nmo, -0.25, scratch, 0, nmo, P2, 0, nmo, 0.0, block, nmo);
+        C_DGEMM_CUBLAS(cublas_handle, false, false, nmo, nmo, nmo, 1.0, P2, 0, nmo, B_A, 0, nmo, 0.0, scratch, nmo);
+        C_DGEMM_CUBLAS(cublas_handle, false, false, nmo, nmo, nmo, -0.25, scratch, 0, nmo, P1, 0, nmo, 1.0, block, nmo);
+
+        // eq. (174)
+        // Coulomb halves: block += 1/2 (g2[A] P1 + g1[A] P2). These are rank one in the fitting index, so each is a
+        // single charge times a density; taking them as (m = k = 1) products keeps g1 and g2 on the device.
+        C_DGEMM_CUBLAS(cublas_handle, false, false, 1, nmo2, 1, 0.5, g2, A, 1, P1, 0, nmo2, 1.0, block, nmo2);
+        C_DGEMM_CUBLAS(cublas_handle, false, false, 1, nmo2, 1, 0.5, g1, A, 1, P2, 0, nmo2, 1.0, block, nmo2);
+
+        // B[A] has now been read for the last time
+        C_DCOPY_CUBLAS(cublas_handle, nmo2, block, 1, B_A, 1);
+    }
+
+    CHECK_CUDA(cudaFree(g1));
+    CHECK_CUDA(cudaFree(g2));
+    CHECK_CUDA(cudaFree(scratch));
+    CHECK_CUDA(cudaFree(block));
+}
+void RDFMP2::store_opdm_cuest(const double* d_P_mo, bool relaxed) {
+    int nocc = Cfocc_->colspi()[0] + Caocc_->colspi()[0];
+    int nmo = nocc + Cavir_->colspi()[0] + Cfvir_->colspi()[0];
+
+    auto Dtemp = std::make_shared<Matrix>("P_pq", nmo, nmo);
+    CHECK_CUDA(cudaMemcpy(Dtemp->pointer()[0], d_P_mo, sizeof(double) * nmo * nmo, cudaMemcpyDeviceToHost));
+
+    // Scale the OPDM so it's no longer spin-summed
+    Dtemp->scale(0.5);
+
+    // Add in the reference density
+    for (int i = 0; i < nocc; ++i) Dtemp->add(i, i, 1.0);
+
+    if (relaxed) {
+        Ca_ = std::make_shared<Matrix>("DF-MP2 Natural Orbitals", nsopi_, nmopi_);
+        epsilon_a_ = std::make_shared<Vector>("DF-MP2 NO Occupations", nmopi_);
+        Da_ = std::make_shared<Matrix>("DF-MP2 relaxed density", nsopi_, nsopi_);
+    } else {
+        Ca_ = std::make_shared<Matrix>("DF-MP2 (unrelaxed) Natural Orbitals", nsopi_, nmopi_);
+        epsilon_a_ = std::make_shared<Vector>("DF-MP2 (unrelaxed) NO Occupations", nmopi_);
+        Da_ = std::make_shared<Matrix>("DF-MP2 unrelaxed density", nsopi_, nsopi_);
+    }
+
+    compute_opdm_and_nos(Dtemp, Da_, Ca_, epsilon_a_);
+    Cb_ = Ca_;
+    epsilon_b_ = epsilon_a_;
+    Db_ = Da_;
 }
 #endif  // USING_cuEST
 void RDFMP2::form_Pab() {

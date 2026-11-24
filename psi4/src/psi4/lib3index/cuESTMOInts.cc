@@ -63,6 +63,14 @@ cuESTMOInts::cuESTMOInts(std::shared_ptr<BasisSet> primary, std::shared_ptr<Basi
 }
 
 cuESTMOInts::~cuESTMOInts() {
+    if (cuest_oe_plan_) {
+        CHECK_CUEST(cuestOEIntPlanDestroy(cuest_oe_plan_));
+        cuest_oe_plan_ = nullptr;
+    }
+    if (cuest_oeint_plan_ws_ptr_) {
+        cuest_common::freeWorkspace(cuest_oeint_plan_ws_ptr_);
+        cuest_oeint_plan_ws_ptr_ = nullptr;
+    }
     if (cuest_df_plan_) {
         CHECK_CUEST(cuestDFIntPlanDestroy(cuest_df_plan_));
         cuest_df_plan_ = nullptr;
@@ -236,6 +244,272 @@ void cuESTMOInts::compute_3c_ints(const std::vector<uint64_t>& nleft, const std:
 
     cuest_common::freeWorkspace(temporaryDFMOWorkspace);
     CHECK_CUEST(cuestParametersDestroy(CUEST_DFMOINTEGRALSCOMPUTE_PARAMETERS, params));
+}
+
+void cuESTMOInts::compute_3c_derivative(const std::vector<uint64_t>& nleft, const std::vector<uint64_t>& nright,
+                                        const double* d_Cleft, const double* d_Cright, const double* d_tpdm,
+                                        double* d_grad) {
+    if (nleft.empty() || nleft.size() != nright.size()) {
+        throw PSIEXCEPTION("cuESTMOInts::compute_3c_derivative: need one or more (left, right) coefficient pairs.");
+    }
+    for (size_t i = 0; i < nleft.size(); ++i) {
+        if (nleft[i] == 0 || nright[i] == 0) {
+            throw PSIEXCEPTION("cuESTMOInts::compute_3c_derivative: cuEST requires at least one left and one right orbital.");
+        }
+    }
+
+    const uint64_t num_matrices = nleft.size();
+
+    cuestDFMOIntegralsDerivativeComputeParameters_t params;
+    CHECK_CUEST(cuestParametersCreate(CUEST_DFMOINTEGRALSDERIVATIVECOMPUTE_PARAMETERS, reinterpret_cast<void**>(&params)));
+
+    // internal scratch for the transform, same default as compute_3c_ints
+    cuestWorkspaceDescriptor_t variableBufferSize;
+    variableBufferSize.hostBufferSizeInBytes = 0;
+    variableBufferSize.deviceBufferSizeInBytes = 2000000000;
+
+    cuestWorkspaceDescriptor_t temporaryWorkspaceDescriptor;
+
+    CHECK_CUEST(cuestDFMOIntegralsDerivativeComputeWorkspaceQuery(
+        cuest_handle,
+        cuest_df_plan_,
+        params,
+        &variableBufferSize,
+        &temporaryWorkspaceDescriptor,
+        num_matrices,
+        nleft.data(),
+        nright.data(),
+        d_Cleft,
+        d_Cright,
+        d_tpdm,
+        d_grad));
+
+    cuest_common::print_memory_row("MO derivative", 0, temporaryWorkspaceDescriptor.deviceBufferSizeInBytes);
+
+    cuestWorkspace_t* temporaryWorkspace = cuest_common::allocateWorkspace(&temporaryWorkspaceDescriptor);
+
+    CHECK_CUEST(cuestDFMOIntegralsDerivativeCompute(
+        cuest_handle,
+        cuest_df_plan_,
+        params,
+        &variableBufferSize,
+        temporaryWorkspace,
+        num_matrices,
+        nleft.data(),
+        nright.data(),
+        d_Cleft,
+        d_Cright,
+        d_tpdm,
+        d_grad));
+
+    cuest_common::freeWorkspace(temporaryWorkspace);
+    CHECK_CUEST(cuestParametersDestroy(CUEST_DFMOINTEGRALSDERIVATIVECOMPUTE_PARAMETERS, params));
+}
+
+void cuESTMOInts::compute_J(const double* d_D, double* d_J) {
+    cuestDFCoulombComputeParameters_t params;
+    CHECK_CUEST(cuestParametersCreate(CUEST_DFCOULOMBCOMPUTE_PARAMETERS, reinterpret_cast<void**>(&params)));
+
+    cuestWorkspaceDescriptor_t temporaryWorkspaceDescriptor;
+
+    CHECK_CUEST(cuestDFCoulombComputeWorkspaceQuery(
+        cuest_handle,
+        cuest_df_plan_,
+        params,
+        &temporaryWorkspaceDescriptor,
+        d_D,
+        d_J));
+
+    cuestWorkspace_t* temporaryWorkspace = cuest_common::allocateWorkspace(&temporaryWorkspaceDescriptor);
+
+    CHECK_CUEST(cuestDFCoulombCompute(
+        cuest_handle,
+        cuest_df_plan_,
+        params,
+        temporaryWorkspace,
+        d_D,
+        d_J));
+
+    cuest_common::freeWorkspace(temporaryWorkspace);
+    CHECK_CUEST(cuestParametersDestroy(CUEST_DFCOULOMBCOMPUTE_PARAMETERS, params));
+}
+
+void cuESTMOInts::compute_K_nonsymmetric(uint64_t nvec, const double* d_Cleft, const double* d_Cright, double* d_K) {
+    cuestDFNonsymmetricExchangeComputeParameters_t params;
+    CHECK_CUEST(cuestParametersCreate(CUEST_DFNONSYMMETRICEXCHANGECOMPUTE_PARAMETERS, reinterpret_cast<void**>(&params)));
+
+    // internal scratch for the exchange build, same default as compute_3c_ints
+    cuestWorkspaceDescriptor_t variableBufferSize;
+    variableBufferSize.hostBufferSizeInBytes = 0;
+    variableBufferSize.deviceBufferSizeInBytes = 2000000000;
+
+    cuestWorkspaceDescriptor_t temporaryWorkspaceDescriptor;
+
+    // a single right coefficient matrix -> a single K
+    CHECK_CUEST(cuestDFNonsymmetricExchangeComputeWorkspaceQuery(
+        cuest_handle,
+        cuest_df_plan_,
+        params,
+        &variableBufferSize,
+        &temporaryWorkspaceDescriptor,
+        1,
+        nvec,
+        d_Cleft,
+        d_Cright,
+        d_K));
+
+    cuestWorkspace_t* temporaryWorkspace = cuest_common::allocateWorkspace(&temporaryWorkspaceDescriptor);
+
+    CHECK_CUEST(cuestDFNonsymmetricExchangeCompute(
+        cuest_handle,
+        cuest_df_plan_,
+        params,
+        &variableBufferSize,
+        temporaryWorkspace,
+        1,
+        nvec,
+        d_Cleft,
+        d_Cright,
+        d_K));
+
+    cuest_common::freeWorkspace(temporaryWorkspace);
+    CHECK_CUEST(cuestParametersDestroy(CUEST_DFNONSYMMETRICEXCHANGECOMPUTE_PARAMETERS, params));
+}
+
+void cuESTMOInts::build_oe_plan() {
+    if (cuest_oe_plan_) return;
+
+    cuestOEIntPlanParameters_t oeint_params;
+    CHECK_CUEST(cuestParametersCreate(CUEST_OEINTPLAN_PARAMETERS, reinterpret_cast<void**>(&oeint_params)));
+
+    cuestWorkspaceDescriptor_t persistentWorkspaceDescriptor;
+    cuestWorkspaceDescriptor_t temporaryWorkspaceDescriptor;
+
+    CHECK_CUEST(cuestOEIntPlanCreateWorkspaceQuery(
+        cuest_handle,
+        cuest_primary_basis_,
+        cuest_pair_list_,
+        oeint_params,
+        &persistentWorkspaceDescriptor,
+        &temporaryWorkspaceDescriptor,
+        &cuest_oe_plan_));
+
+    cuest_common::print_memory_row("OE plan", persistentWorkspaceDescriptor.deviceBufferSizeInBytes,
+                                   temporaryWorkspaceDescriptor.deviceBufferSizeInBytes);
+
+    cuest_oeint_plan_ws_ptr_ = cuest_common::allocateWorkspace(&persistentWorkspaceDescriptor);
+    cuestWorkspace_t* temporaryOEIntPlanWorkspace = cuest_common::allocateWorkspace(&temporaryWorkspaceDescriptor);
+
+    CHECK_CUEST(cuestOEIntPlanCreate(
+        cuest_handle,
+        cuest_primary_basis_,
+        cuest_pair_list_,
+        oeint_params,
+        cuest_oeint_plan_ws_ptr_,
+        temporaryOEIntPlanWorkspace,
+        &cuest_oe_plan_));
+
+    cuest_common::freeWorkspace(temporaryOEIntPlanWorkspace);
+    CHECK_CUEST(cuestParametersDestroy(CUEST_OEINTPLAN_PARAMETERS, oeint_params));
+}
+
+void cuESTMOInts::compute_overlap_derivative(const double* d_W, double* d_grad) {
+    build_oe_plan();
+
+    cuestOverlapDerivativeComputeParameters_t params;
+    CHECK_CUEST(cuestParametersCreate(CUEST_OVERLAPDERIVATIVECOMPUTE_PARAMETERS, reinterpret_cast<void**>(&params)));
+
+    cuestWorkspaceDescriptor_t temporaryWorkspaceDescriptor;
+
+    CHECK_CUEST(cuestOverlapDerivativeComputeWorkspaceQuery(
+        cuest_handle,
+        cuest_oe_plan_,
+        params,
+        &temporaryWorkspaceDescriptor,
+        d_W,
+        d_grad));
+
+    cuestWorkspace_t* temporaryWorkspace = cuest_common::allocateWorkspace(&temporaryWorkspaceDescriptor);
+
+    CHECK_CUEST(cuestOverlapDerivativeCompute(
+        cuest_handle,
+        cuest_oe_plan_,
+        params,
+        temporaryWorkspace,
+        d_W,
+        d_grad));
+
+    cuest_common::freeWorkspace(temporaryWorkspace);
+    CHECK_CUEST(cuestParametersDestroy(CUEST_OVERLAPDERIVATIVECOMPUTE_PARAMETERS, params));
+}
+
+void cuESTMOInts::compute_kinetic_derivative(const double* d_D, double* d_grad) {
+    build_oe_plan();
+
+    cuestKineticDerivativeComputeParameters_t params;
+    CHECK_CUEST(cuestParametersCreate(CUEST_KINETICDERIVATIVECOMPUTE_PARAMETERS, reinterpret_cast<void**>(&params)));
+
+    cuestWorkspaceDescriptor_t temporaryWorkspaceDescriptor;
+
+    CHECK_CUEST(cuestKineticDerivativeComputeWorkspaceQuery(
+        cuest_handle,
+        cuest_oe_plan_,
+        params,
+        &temporaryWorkspaceDescriptor,
+        d_D,
+        d_grad));
+
+    cuestWorkspace_t* temporaryWorkspace = cuest_common::allocateWorkspace(&temporaryWorkspaceDescriptor);
+
+    CHECK_CUEST(cuestKineticDerivativeCompute(
+        cuest_handle,
+        cuest_oe_plan_,
+        params,
+        temporaryWorkspace,
+        d_D,
+        d_grad));
+
+    cuest_common::freeWorkspace(temporaryWorkspace);
+    CHECK_CUEST(cuestParametersDestroy(CUEST_KINETICDERIVATIVECOMPUTE_PARAMETERS, params));
+}
+
+void cuESTMOInts::compute_potential_derivative(uint64_t ncharge, const double* d_xyz, const double* d_q,
+                                               const double* d_D, double* d_grad_basis, double* d_grad_charge) {
+    build_oe_plan();
+
+    cuestPotentialDerivativeComputeParameters_t params;
+    CHECK_CUEST(cuestParametersCreate(CUEST_POTENTIALDERIVATIVECOMPUTE_PARAMETERS, reinterpret_cast<void**>(&params)));
+
+    cuestWorkspaceDescriptor_t temporaryWorkspaceDescriptor;
+
+    CHECK_CUEST(cuestPotentialDerivativeComputeWorkspaceQuery(
+        cuest_handle,
+        cuest_oe_plan_,
+        params,
+        &temporaryWorkspaceDescriptor,
+        ncharge,
+        d_xyz,
+        d_q,
+        d_D,
+        d_grad_basis,
+        d_grad_charge));
+
+    cuestWorkspace_t* temporaryWorkspace = cuest_common::allocateWorkspace(&temporaryWorkspaceDescriptor);
+
+    CHECK_CUEST(cuestPotentialDerivativeCompute(
+        cuest_handle,
+        cuest_oe_plan_,
+        params,
+        temporaryWorkspace,
+        ncharge,
+        d_xyz,
+        d_q,
+        d_D,
+        d_grad_basis,
+        d_grad_charge));
+
+    cuest_common::freeWorkspace(temporaryWorkspace);
+    CHECK_CUEST(cuestParametersDestroy(CUEST_POTENTIALDERIVATIVECOMPUTE_PARAMETERS, params));
 }
 
 }  // namespace psi

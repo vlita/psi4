@@ -93,5 +93,35 @@ void C_DDOT_CUBLAS(
                 result));
 }
 
+void C_DSCAL_CUBLAS(
+    cublasHandle_t handle, int n,
+    double alpha, double *x, int incx
+) {
+
+    double alpha_arg = alpha;
+
+    CHECK_CUBLAS(cublasDscal(handle, n, &alpha_arg, x, incx));
+}
+
+void C_DCOPY_CUBLAS(
+    cublasHandle_t handle, int n,
+    const double *x, int incx,
+    double *y, int incy
+) {
+
+    CHECK_CUBLAS(cublasDcopy(handle, n, x, incx, y, incy));
+}
+
+void C_DAXPY_CUBLAS(
+    cublasHandle_t handle, int n,
+    double alpha, const double *x, int incx,
+    double *y, int incy
+) {
+
+    double alpha_arg = alpha;
+
+    CHECK_CUBLAS(cublasDaxpy(handle, n, &alpha_arg, x, incx, y, incy));
+}
+
 } // namespace psi
 #endif

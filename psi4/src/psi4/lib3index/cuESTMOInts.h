@@ -71,7 +71,12 @@ class cuESTMOInts {
     cuestWorkspace_t* cuest_pair_list_ws_ptr_ = nullptr;
     cuestWorkspace_t* cuest_dfint_plan_ws_ptr_ = nullptr;
 
+    // One-electron plan on the same pair list, only built if a one-electron derivative is requested
+    cuestOEIntPlan_t cuest_oe_plan_ = nullptr;
+    cuestWorkspace_t* cuest_oeint_plan_ws_ptr_ = nullptr;
+
     void common_init();
+    void build_oe_plan();
 
    public:
     cuESTMOInts(std::shared_ptr<BasisSet> primary, std::shared_ptr<BasisSet> auxiliary, Options& options);
@@ -90,6 +95,33 @@ class cuESTMOInts {
      */
     void compute_3c_ints(const std::vector<uint64_t>& nleft, const std::vector<uint64_t>& nright, const double* d_Cleft,
                          const double* d_Cright, double* d_out);
+
+    /**
+     * Nuclear gradient of sum_A sum_lr gamma3(A|lr) B(A|lr), the counterpart of compute_3c_ints.
+     *
+     * nleft / nright / d_Cleft / d_Cright: as in compute_3c_ints.
+     * d_tpdm:   DEVICE three-center TPDM, laid out exactly like the d_out of compute_3c_ints. It is
+     *           assumed bra-ket symmetric; any pair symmetry or spin factor must already be folded in.
+     * d_grad:   DEVICE buffer of natom * 3 doubles, overwritten (not accumulated).
+     */
+    void compute_3c_derivative(const std::vector<uint64_t>& nleft, const std::vector<uint64_t>& nright,
+                               const double* d_Cleft, const double* d_Cright, const double* d_tpdm, double* d_grad);
+
+    /// J(D) for a DEVICE symmetric AO density [nbf, nbf]; d_J is overwritten.
+    void compute_J(const double* d_D, double* d_J);
+
+    /**
+     * K_mn = sum_ls (ml|ns) sum_i L_il R_is with DEVICE coefficient buffers d_Cleft, d_Cright of
+     * shape [nvec, nbf]; d_K [nbf, nbf] is overwritten.
+     */
+    void compute_K_nonsymmetric(uint64_t nvec, const double* d_Cleft, const double* d_Cright, double* d_K);
+
+    /// One-electron derivative integrals contracted with a DEVICE AO matrix [nbf, nbf]; d_grad [natom, 3] is overwritten.
+    void compute_overlap_derivative(const double* d_W, double* d_grad);
+    void compute_kinetic_derivative(const double* d_D, double* d_grad);
+    /// Point charges q at xyz (DEVICE, [ncharge] and [ncharge, 3]); basis and charge parts come back separately.
+    void compute_potential_derivative(uint64_t ncharge, const double* d_xyz, const double* d_q, const double* d_D,
+                                      double* d_grad_basis, double* d_grad_charge);
 };
 
 }  // namespace psi
