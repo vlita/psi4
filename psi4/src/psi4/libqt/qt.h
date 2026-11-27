@@ -121,6 +121,9 @@ double C_DDOT(size_t n, const double* const X, int inc_x, const double* const Y,
 
 #ifdef USING_cuEST
 void C_DDOT_CUBLAS(cublasHandle_t handle, int n, const double* x, int offx, int incx, const double* y, int offy, int incy, double* result);
+void C_DSCAL_CUBLAS(cublasHandle_t handle, int n, double alpha, double* x, int incx);
+void C_DCOPY_CUBLAS(cublasHandle_t handle, int n, const double* x, int incx, double* y, int incy);
+void C_DAXPY_CUBLAS(cublasHandle_t handle, int n, double alpha, const double* x, int incx, double* y, int incy);
 #endif
 
 double C_DNRM2(size_t n, double* X, int inc_x);

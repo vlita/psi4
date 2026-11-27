@@ -35,6 +35,9 @@
 namespace psi {
 
 class PSIO;
+#ifdef USING_cuEST
+class cuESTMOInts;
+#endif
 
 namespace dfmp2 {
 
@@ -159,6 +162,28 @@ class RDFMP2 : public DFMP2 {
     void form_Bia_cuest();
     // Form the energy contributions using cuEST & cuBLAS
     void form_energy_cuest();
+
+    // => cuEST gradient; references are to Aikens et al., Theor Chem Acc 110, 233 (2003) <= //
+
+    // Manage the full gradient: RI-fitted correlation terms, z-vector, JK-fitted separable terms, one-electron terms
+    void form_gradient_cuest();
+    // Amplitudes in one pass over i: the energy, P_ij and P_ab (Aikens 177, 178) and the RI gamma3 (Aikens 171)
+    void form_correlation_intermediates_cuest(const double* B_ov, const double* d_eps, double* P_ij, double* P_ab,
+                                              double* gamma3);
+    // The non-separable pieces of the generalized Fock matrix and Lagrangian (Aikens 159, 181, 182, 183)
+    void form_lagrangian_cuest(const double* B_oo, const double* B_ov, const double* B_vv, const double* gamma3,
+                               double* W_I_ij, double* W_I_ab, double* half_L_ai_NS, double* half_W_I_ai);
+    // veff(P) = J(P) - 1/2 K(P) for an AO density, symmetrized first
+    void form_veff_cuest(cuESTMOInts& jk_ints, const double* P_ao, double* veff);
+    // out[a,i] = 2 [C_vir veff(P_ao) C_occ^T]_ai, the occupied-virtual Fock response (Aikens 158)
+    void form_fock_response_cuest(cuESTMOInts& jk_ints, const double* d_C, const double* P_ao, double* out);
+    // Preconditioned conjugate gradient solution of the z-vector equations A P_ai = -L_ai (Aikens 163)
+    void solve_z_vector_cuest(cuESTMOInts& jk_ints, const double* d_C, const double* d_eps, const double* minus_L_ai,
+                              double* P_ai);
+    // Overwrite B[A,pq] with the separable three-center TPDM of densities P1 and P2 (Aikens 174)
+    void form_gamma3_separable_cuest(double* B, const double* P1, const double* P2, size_t naux);
+    // Store the (relaxed or unrelaxed) OPDM and natural orbitals from a DEVICE spin-summed MO correlation density
+    void store_opdm_cuest(const double* d_P_mo, bool relaxed);
 #endif
     // Form the energy contributions and gradients
     void form_Pab() override;
@@ -186,6 +211,11 @@ class RDFMP2 : public DFMP2 {
    public:
     RDFMP2(SharedWavefunction ref_wfn, Options& options, std::shared_ptr<PSIO> psio);
     ~RDFMP2() override;
+
+#ifdef USING_cuEST
+    // Dispatches to the cuEST gradient when USE_CUEST is set
+    SharedMatrix compute_gradient() override;
+#endif
 };
 
 class UDFMP2 : public DFMP2 {
